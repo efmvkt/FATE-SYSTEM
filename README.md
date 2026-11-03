@@ -1,4 +1,3 @@
-# FATE-SYSTEM
 # FATE SYSTEM — Passive Observer (v0.3.0)
 
 Mobile-first SillyTavern UI extension. FATE SYSTEM is an **observer**, not a character controller.
