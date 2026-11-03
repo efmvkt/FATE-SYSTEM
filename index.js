@@ -329,23 +329,57 @@ async function handleIncoming() {
         await analyzeNow();
     }
 }
-function init() {
-    ctx = SillyTavern.getContext();
-    settings = { ...DEFAULTS, ...(ctx.extensionSettings[MODULE] || {}) };
-    ctx.extensionSettings[MODULE] = settings;
-    ctx.saveSettingsDebounced();
-    ensurePanel();
-    loadState();
-    const { eventSource, event_types } = ctx;
-    eventSource.on(event_types.MESSAGE_RECEIVED, handleIncoming);
-    eventSource.on(event_types.CHAT_CHANGED, loadState);
-    eventSource.on(event_types.CHAT_CREATED, loadState);
-    console.log(PREFIX, 'Extension initialized.');
+let initialized = false;
+
+async function init() {
+    if (initialized) return;
+    try {
+        if (!window.SillyTavern || typeof window.SillyTavern.getContext !== 'function') {
+            throw new Error('SillyTavern context API is not available yet.');
+        }
+        ctx = window.SillyTavern.getContext();
+        if (!ctx || !ctx.eventSource || !ctx.event_types) {
+            throw new Error('SillyTavern event system is not ready yet.');
+        }
+        settings = { ...DEFAULTS, ...(ctx.extensionSettings?.[MODULE] || {}) };
+        ctx.extensionSettings[MODULE] = settings;
+        ctx.saveSettingsDebounced?.();
+
+        // The launcher and panel are created only after the application is ready.
+        ensurePanel();
+        await loadState();
+
+        const { eventSource, event_types } = ctx;
+        if (event_types.MESSAGE_RECEIVED) eventSource.on(event_types.MESSAGE_RECEIVED, handleIncoming);
+        if (event_types.CHAT_CHANGED) eventSource.on(event_types.CHAT_CHANGED, loadState);
+        if (event_types.CHAT_CREATED) eventSource.on(event_types.CHAT_CREATED, loadState);
+        initialized = true;
+        console.info(PREFIX, 'Initialized successfully; launcher mounted:', !!document.getElementById('fate-system-launcher'));
+        notify('FATE SYSTEM is ready. Tap ✦ FATE in the lower-right corner.', 'success');
+    } catch (error) {
+        console.error(PREFIX, 'Initialization failed:', error);
+        if (window.toastr?.error) window.toastr.error(error.message, 'FATE SYSTEM');
+    }
 }
-jQuery(() => {
-    const wait = () => {
-        if (window.SillyTavern?.getContext) init();
-        else setTimeout(wait, 500);
-    };
-    wait();
-});
+
+// APP_READY is the documented lifecycle event for non-blocking asynchronous UI setup.
+// The fallback handles older builds that do not expose that event constant.
+function registerLifecycle() {
+    try {
+        const context = window.SillyTavern?.getContext?.();
+        const readyEvent = context?.event_types?.APP_READY;
+        if (readyEvent && context.eventSource?.on) {
+            context.eventSource.on(readyEvent, () => { void init(); });
+            return;
+        }
+    } catch (error) {
+        console.warn(PREFIX, 'Could not subscribe to APP_READY; using DOM-ready fallback.', error);
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => { void init(); }, { once: true });
+    } else {
+        void init();
+    }
+}
+
+registerLifecycle();
