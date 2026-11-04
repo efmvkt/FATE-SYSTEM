@@ -90,7 +90,12 @@
 
     // что показать после обновления: сравниваем старое состояние с новым
     function announce(old, st, events, fresh) {
-        if (!old) { popup('stage', st.stage || 'Система создана', 'Система запущена ✦'); return; }
+        if (!old) {
+            popup('stage', st.stage || 'Система создана', 'Система запущена ✦');
+            const n = (st.calendar?.events || []).length;
+            if (n) setTimeout(() => popup('event', `Запланировано событий: ${n}`, 'Календарь готов'), 500);
+            return;
+        }
         const out = [];
         const oldQ = new Map(old.quests.map(q => [q.id, q]));
         for (const q of st.quests) {
@@ -108,6 +113,14 @@
         for (const e of events) if (e.type === 'penalty') out.push(['penalty', e.text, LEVEL_TITLE[e.level] || 'Штраф']);
         (fresh?.ach || []).forEach(a => out.push(['ach', `${a.icon} ${a.title}`, 'Достижение получено!']));
         if (st.hook && st.hook.title !== old.hook?.title) out.push(['event', st.hook.title, 'Новое событие']);
+        const oldE = new Map((old.calendar?.events || []).map(e => [e.id, e]));
+        const newE = (st.calendar?.events || []).filter(e => !oldE.has(e.id) && e.status === 'upcoming');
+        if (newE.length) out.push(['event', newE.slice(0, 2).map(e => e.title).join(', ') + (newE.length > 2 ? ` и ещё ${newE.length - 2}` : ''), 'Новое в календаре']);
+        for (const e of (st.calendar?.events || [])) {
+            const o = oldE.get(e.id);
+            if (o && o.status === 'upcoming' && e.status === 'done') out.push(['reward', e.title, 'Событие состоялось']);
+            if (o && o.status === 'upcoming' && e.status === 'missed') out.push(['penalty', e.title, e.required ? 'Обязательное событие пропущено!' : 'Событие пропущено']);
+        }
         out.slice(0, 5).forEach(([k, text, title], i) => setTimeout(() => popup(k, text, title), i * 450));
     }
 
@@ -140,6 +153,57 @@
         return null;
     }
 
+    // ─── даты внутри истории ───────────────────────────────────────────────
+
+    const DAY = 86400000;
+    const pad2 = n => String(n).padStart(2, '0');
+
+    function parseDMY(v) {
+        const m = String(v || '').match(/(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{2,4})/);
+        if (!m) return null;
+        let d = Number(m[1]), mo = Number(m[2]), y = Number(m[3]);
+        if (y < 100) y += 2000;
+        if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+        return Math.floor(Date.UTC(y, mo - 1, d) / DAY);
+    }
+    function dayParts(n) {
+        const dt = new Date(n * DAY);
+        return { d: dt.getUTCDate(), m: dt.getUTCMonth() + 1, y: dt.getUTCFullYear() };
+    }
+    const fmtDay = n => { const p = dayParts(n); return `${pad2(p.d)}.${pad2(p.m)}`; };
+    const fmtFull = n => { const p = dayParts(n); return `${pad2(p.d)}.${pad2(p.m)}.${p.y}`; };
+    function rel(n, now) {
+        if (n == null || now == null) return '';
+        const k = n - now;
+        if (k === 0) return 'сегодня';
+        if (k === 1) return 'завтра';
+        if (k === -1) return 'вчера';
+        return k > 0 ? `через ${k} дн.` : `${-k} дн. назад`;
+    }
+    // «сегодня» в истории: свежая дата из инфоблока, иначе последняя, которую вернула Система
+    const nowDay = st => parseDMY(lastIB()?.date) ?? st?.calendar?.day ?? null;
+
+    function monthGrid(now, off) {
+        const p = dayParts(now);
+        let mm = p.m - 1 + off;
+        const y = p.y + Math.floor(mm / 12);
+        mm = ((mm % 12) + 12) % 12;
+        const first = Math.floor(Date.UTC(y, mm, 1) / DAY);
+        const wd = (new Date(first * DAY).getUTCDay() + 6) % 7;
+        const dim = new Date(Date.UTC(y, mm + 1, 0)).getUTCDate();
+        return { y, m: mm, first, wd, dim };
+    }
+
+    // если дата события прошла, а итог не подведён, при обновлении просим модель решить: состоялось или пропущено
+    function overdueNote(st) {
+        if (!S().mCal || !st?.calendar?.events?.length) return '';
+        const now = nowDay(st);
+        if (now == null) return '';
+        const od = st.calendar.events.filter(e => e.status === 'upcoming' && e.day != null && e.day < now);
+        if (!od.length) return '';
+        return `The in-story date passed for these calendar events: ${od.map(e => `"${e.title}" (id ${e.id}${e.required ? ', required' : ''}${e.quest ? ', quest ' + e.quest : ''})`).join('; ')}. Resolve each one now: status "done" if the chat shows it happened or the player attended, "missed" if not. A missed required event fails its linked quest and causes a penalty.`;
+    }
+
     // ─── prompts ───────────────────────────────────────────────────────────
 
     const SCHEMA_BASE = `{
@@ -168,7 +232,7 @@
         if (s.mEnd) extra += `,
   "endings": [{"id": "e1", "kind": "good|neutral|bad|true", "title": "", "hint": "<what has to happen>", "progress": 0, "revealed": true}]`;
         if (s.mCal) extra += `,
-  "calendar": {"date": "<in-story date from the chat, or Unknown>", "season": "<season or Unknown>", "upcoming": [{"title": "", "when": "<date or 'через N дней'>", "note": "<short>", "source": "story|suggested"}]}`;
+  "calendar": {"today": "<current in-story date as DD.MM.YYYY>", "events": [{"id": "c1", "title": "", "type": "ball|meeting|duty|trip|holiday|deadline|other", "in_days": 0, "time": "<HH:MM or empty>", "place": "", "note": "<short>", "required": true, "quest": "<linked quest id or empty>", "status": "upcoming|done|missed"}]}`;
         return SCHEMA_BASE.replace('@@EXTRA@@', extra);
     }
 
@@ -179,9 +243,24 @@
 `;
         if (s.mEnd) r += `- endings: 3-5 possible story directions (tendencies, not scripts; do not spoil). Keep ids stable. progress 0-100 = how close the story is to each right now. A "true" ending stays revealed=false until the story has clearly opened it. Set "ending" to the one-line direction of the leading route.
 `;
-        if (s.mCal) r += `- calendar: up to 5 upcoming dated events: those already mentioned in the chat or card (source "story") and at most 2 plausible seasonal or social ones for this world (source "suggested": a ball, a holiday, a birthday, a departure). Use the in-story date from the chat.
+        if (s.mCal) r += `- calendar.today: the current in-story date as DD.MM.YYYY. Take it from the chat or the infoblock; if the story gives none, invent a plausible one for the setting and keep it consistent with the previous value (it moves forward only as story time passes).
+- calendar.events: plan the next ~3 weeks of this world as a calendar of 4-8 upcoming events on concrete days (in_days counted from today, 0 = today). Mix social events (balls, receptions, teas, theatre), duties (service, family, work, trips), holidays and seasonal customs, meetings with other characters, and deadlines. Tie at least 2 events to active quests (put the quest id) so that quests have scheduled things to do. required=true means missing it has consequences; the main plot's social obligations are usually required, holidays are not. Keep ids stable and do not move events without a story reason.
+- an event whose day has passed must be resolved: "done" if the chat shows it happened or the player attended, "missed" if not. A missed required event fails its linked quest and causes a penalty (lower a stat, add a penalty event). Never pretend something happened just to resolve an event.
 `;
         return r;
+    }
+
+    function compactCal(st) {
+        const cal = st.calendar;
+        if (!cal) return null;
+        const now = nowDay(st);
+        return {
+            today: now != null ? fmtFull(now) : (cal.today || ''),
+            events: (cal.events || []).map(e => ({
+                id: e.id, title: e.title, type: e.type, in_days: (e.day != null && now != null) ? e.day - now : null,
+                time: e.time, place: e.place, note: e.note, required: e.required, quest: e.quest, status: e.status,
+            })),
+        };
     }
 
     function compact(st) {
@@ -198,7 +277,7 @@
             memories: (st.memories || []).slice(0, 8).map(m => m.text),
             ...(S().mAch ? { achievements: (st.achievements || []).slice(0, 12).map(a => a.title) } : {}),
             ...(S().mEnd ? { endings: (st.endings || []).map(e => ({ id: e.id, kind: e.kind, title: e.title, progress: e.progress, revealed: e.revealed })) } : {}),
-            ...(S().mCal ? { calendar: st.calendar || null } : {}),
+            ...(S().mCal ? { calendar: compactCal(st) } : {}),
         };
     }
 
@@ -226,6 +305,8 @@
             p += `CHARACTER PROFILE (${cn}): ${old.profile || ''}\n\n`;
         }
         p += `PLAYER PERSONA: ${un}\n`;
+        const ib0 = lastIB();
+        if (ib0?.date) p += `IN-STORY DATE (from the chat's infoblock): ${ib0.date}\n`;
         if (s.extra.trim()) p += `PLAYER'S EXTRA WISHES FOR THE SYSTEM: ${s.extra.trim()}\n`;
         p += `\nCURRENT STATE (turn ${turns()}):\n${old ? JSON.stringify(compact(old)) : 'none — create the system from scratch'}\n`;
         if (note) p += `\nNOTE: ${note}\n`;
@@ -399,15 +480,33 @@ ${buildSchema()}`;
             })).filter(e => e.title);
         }
         if (S().mCal && raw.calendar && typeof raw.calendar === 'object') {
-            st.calendar = {
-                date: str(raw.calendar.date), season: str(raw.calendar.season),
-                upcoming: arr(raw.calendar.upcoming).slice(0, 5).map(u => ({
-                    title: str(u?.title), when: str(u?.when), note: str(u?.note),
-                    source: u?.source === 'suggested' ? 'suggested' : 'story',
-                })).filter(u => u.title),
-            };
+            const rc = raw.calendar;
+            const base = parseDMY(lastIB()?.date) ?? parseDMY(rc.today) ?? old?.calendar?.day ?? null;
+            const oldEv = old?.calendar?.events || [];
+            const E_TYPES = ['ball', 'meeting', 'duty', 'trip', 'holiday', 'deadline', 'other'];
+            const evs = arr(rc.events).slice(0, 10).map((e, i) => {
+                const id = str(e?.id) || ('c' + (i + 1));
+                const o = oldEv.find(x => x.id === id);
+                const inDays = Number(e?.in_days);
+                let day = o?.day ?? null;
+                if (base != null && Number.isFinite(inDays)) day = base + Math.round(inDays);
+                const status = ['done', 'missed'].includes(e?.status) ? e.status : 'upcoming';
+                if (o && o.status === 'upcoming' && status === 'missed') st.log.unshift({ turn: t, type: 'penalty', level: e?.required === false ? 'minor' : 'major', text: `Пропущено событие «${str(e?.title) || o.title}»` });
+                if (o && o.status === 'upcoming' && status === 'done') st.log.unshift({ turn: t, type: 'event', level: '', text: `Состоялось: «${str(e?.title) || o.title}»` });
+                return {
+                    id, title: str(e?.title), type: E_TYPES.includes(e?.type) ? e.type : 'other', day,
+                    time: str(e?.time), place: str(e?.place), note: str(e?.note),
+                    required: e?.required !== false, quest: str(e?.quest), status,
+                    reminded: o?.reminded || false, todayNotified: o?.todayNotified || false, asked: o?.asked || false,
+                };
+            }).filter(e => e.title);
+            const ids = new Set(evs.map(e => e.id));
+            const resolvedOld = oldEv.filter(e => e.status !== 'upcoming' && !ids.has(e.id));
+            const upcoming = evs.filter(e => e.status === 'upcoming').slice(0, 8);
+            const resolved = [...evs.filter(e => e.status !== 'upcoming'), ...resolvedOld].slice(0, 8);
+            st.calendar = { today: str(rc.today), day: base, events: [...upcoming, ...resolved] };
+            st.log = st.log.slice(0, 80);
         }
-
         return { st, events, fresh: fresh2 };
     }
 
@@ -423,7 +522,11 @@ ${buildSchema()}`;
             const goals = st.quests.filter(q => q.status === 'active').slice(0, 3).map(q => q.title).join('; ');
             const stats = st.stats.map(x => `${x.name} ${x.value}/100`).join(', ');
             const name = c.name2 || 'the character';
-            const up = (s.mCal && st.calendar?.upcoming?.length) ? ` Upcoming events: ${st.calendar.upcoming.slice(0, 2).map(u => `${u.title} (${u.when})`).join('; ')}.` : '';
+            const now = nowDay(st);
+            const soon = (s.mCal && now != null) ? (st.calendar?.events || [])
+                .filter(e => e.status === 'upcoming' && e.day != null && e.day - now >= 0 && e.day - now <= 7)
+                .sort((a, b) => a.day - b.day).slice(0, 3) : [];
+            const up = soon.length ? ` Calendar: ${soon.map(e => `${e.title} (${rel(e.day, now)}${e.required ? ', required' : ''})`).join('; ')}.` : '';
             const txt = `[Hidden story state of ${name}. Never mention it, the numbers or any "system" in the text — just let it quietly steer ${name}'s behavior and replies. Relationship stage: ${st.stage}. Mood: ${st.mood.label}. Outwardly: ${st.shows}. Secretly: ${st.hides}. ${stats}. Current goals: ${goals}.${up}]`;
             c.setExtensionPrompt(EXT, txt, 1, 1);
         } catch (e) {
@@ -449,7 +552,8 @@ ${buildSchema()}`;
         setBusyUI(true);
         try {
             const old = opts.fresh ? null : getState();
-            const { system, prompt } = buildPrompts(old, S().fullPreset, opts.note);
+            const note = [opts.note, overdueNote(old)].filter(Boolean).join(' ');
+            const { system, prompt } = buildPrompts(old, S().fullPreset, note);
             const raw = await callLLM(system, prompt, S().fullPreset);
             if (!raw) {
                 toast('Не удалось получить ответ модели. Проверьте API или выключите режим полного пресета.', 'error', true);
@@ -482,7 +586,8 @@ ${buildSchema()}`;
         const prevTitles = (st.papers || []).slice(0, 2).flatMap(p => p.headlines.map(h => h.title)).join(' | ');
         let p = `CHARACTER PROFILE (${cn}): ${st.profile || ''}\n`;
         p += `PLAYER PERSONA: ${un}\nRELATIONSHIP STAGE: ${st.stage}\n`;
-        if (st.calendar?.date) p += `IN-STORY DATE: ${st.calendar.date}${st.calendar.season ? ', ' + st.calendar.season : ''}\n`;
+        const nd = nowDay(st);
+        if (nd != null) p += `IN-STORY DATE: ${fmtFull(nd)}, ${seasonOf(fmtFull(nd))[1]}\n`;
         p += `ACTIVE PLOT THREADS: ${st.quests.filter(q => q.status === 'active').map(q => q.title).join('; ') || 'none'}\n`;
         if (prevTitles) p += `ALREADY PRINTED (do not repeat): ${prevTitles}\n`;
         if (S().extra.trim()) p += `PLAYER'S WISHES: ${S().extra.trim()}\n`;
@@ -557,7 +662,33 @@ JSON SHAPE:
             if (!isOpen()) { unseen = true; updateFabDot(); }
         }
 
-        if (s.auto && (expired.length || t - (st.lastTurn || 0) >= s.every)) {
+        // календарь: напоминания и просроченные события
+        let calDue = false;
+        const nowD = nowDay(st);
+        if (s.mCal && st.calendar?.events?.length && nowD != null) {
+            let changed = false;
+            for (const e of st.calendar.events) {
+                if (e.status !== 'upcoming' || e.day == null) continue;
+                const k = e.day - nowD;
+                if (k < 0) {
+                    if (!e.asked) { e.asked = true; changed = true; calDue = true; }
+                } else if (k === 0 && !e.todayNotified) {
+                    e.todayNotified = true;
+                    changed = true;
+                    popup('event', `${e.title}${e.required ? ' — обязательно' : ''}`, 'Сегодня в календаре!');
+                } else if (k > 0 && k <= 2 && !e.reminded) {
+                    e.reminded = true;
+                    changed = true;
+                    popup('event', `${e.title} · ${rel(e.day, nowD)}`, 'Скоро событие');
+                }
+            }
+            if (changed) {
+                setState(st);
+                if (!isOpen()) { unseen = true; updateFabDot(); }
+            }
+        }
+
+        if (s.auto && (expired.length || calDue || t - (st.lastTurn || 0) >= s.every)) {
             setTimeout(() => runUpdate({ note }), 700);
         } else {
             render();
@@ -637,15 +768,19 @@ JSON SHAPE:
     function viewQuests(st) {
         if (!st) return emptyView();
         const t = turns();
+        const nowQ = nowDay(st);
         const active = st.quests.filter(q => q.status === 'active');
         const done = st.quests.filter(q => q.status === 'done' || q.status === 'failed');
         const locked = st.quests.filter(q => q.status === 'locked');
         const card = q => {
             const left = q.dueTurn ? Math.max(0, q.dueTurn - t) : null;
+            const ev = (st.calendar?.events || []).filter(e => e.quest === q.id && e.status === 'upcoming')
+                .map(e => `<div class="otm-qev">📅 ${esc(e.title)}${e.day != null && nowQ != null ? ' · ' + rel(e.day, nowQ) : ''}</div>`).join('');
             return `<div class="otm-q otm-${esc(q.type)}">
                 <div class="otm-qh"><span class="otm-chip">${Q_LABEL[q.type]}</span>${left !== null ? `<span class="otm-due">⏳ ${left} ход.</span>` : ''}</div>
                 <div class="otm-qt">${esc(q.title)}</div>
                 <div class="otm-qd">${esc(q.desc)}</div>
+                ${ev}
                 <div class="otm-qr"><span class="gain">🎁 ${esc(q.reward || '—')}</span><span class="loss">⚠ ${esc(q.penalty || '—')}</span></div>
             </div>`;
         };
@@ -704,17 +839,55 @@ JSON SHAPE:
         return ['✦', ''];
     }
 
+    let calOff = 0;
+    let calSel = null;
+    const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+    const EV_ICON = { ball: '💃', meeting: '🤝', duty: '🛡️', trip: '🧳', holiday: '🎉', deadline: '⏰', other: '✦' };
+
     function viewCalendar(st) {
         if (!st) return emptyView();
-        const ib = lastIB();
-        const cal = st.calendar || {};
-        const date = ib?.date || cal.date || '';
-        const [se, sn] = seasonOf(date, cal.season);
-        const sub = [sn, ib?.time, ib?.loc, ib?.weather].filter(Boolean).map(esc).join(' · ');
-        const up = (cal.upcoming || []).map(u => `<div class="otm-ev"><span class="otm-evw">${esc(u.when)}</span><div><b>${esc(u.title)}</b>${u.note ? `<small>${esc(u.note)}</small>` : ''}</div><i class="otm-src ${u.source}">${u.source === 'suggested' ? 'идея' : 'сюжет'}</i></div>`).join('');
-        return `<div class="otm-cal"><div class="otm-season">${se}</div><div><div class="otm-date">${esc(date || 'Дата неизвестна')}</div><div class="otm-calsub">${sub}</div></div></div>
-            ${section('Ближайшие события')}${up || '<div class="otm-none">Событий пока нет. Они появятся после обновления Системы.</div>'}
-            <div class="otm-hint">Дата, время и место берутся из инфоблока последнего ответа.</div>`;
+        const events = st.calendar?.events || [];
+        const now = nowDay(st);
+        if (now == null || !events.length) {
+            return `<div class="otm-empty"><div class="otm-big">📅</div><div class="otm-etitle">Календарь пуст</div><div class="otm-edesc">${S().mCal ? 'Система спланирует ближайшие недели: балы, встречи, обязанности, праздники и сроки заданий, и привяжет их к вашим заданиям.' : 'Календарь выключен в настройках.'}</div>${S().mCal ? '<button class="otm-btn otm-primary" data-act="update">🔄 Составить календарь</button>' : ''}</div>`;
+        }
+        const { y, m, first, wd, dim } = monthGrid(now, calOff);
+        const byDay = new Map();
+        for (const e of events) {
+            if (e.day == null) continue;
+            if (!byDay.has(e.day)) byDay.set(e.day, []);
+            byDay.get(e.day).push(e);
+        }
+        let cells = '';
+        for (let i = 0; i < wd; i++) cells += '<div class="otm-cd empty"></div>';
+        for (let d = 1; d <= dim; d++) {
+            const day = first + d - 1;
+            const list = byDay.get(day) || [];
+            const dots = list.slice(0, 3).map(e => `<i class="${e.status === 'missed' ? 'bad' : (e.status === 'done' ? 'ok' : (e.required ? 'req' : ''))}"></i>`).join('');
+            cells += `<button class="otm-cd${day === now ? ' today' : ''}${day === calSel ? ' sel' : ''}${list.length ? ' has' : ''}" data-act="calday" data-day="${day}">${d}<span class="otm-dots">${dots}</span></button>`;
+        }
+        const head = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'].map(x => `<div class="otm-cw">${x}</div>`).join('');
+        const quests = new Map(st.quests.map(q => [q.id, q]));
+        const row = e => {
+            const k = (e.day != null) ? e.day - now : null;
+            const over = e.status === 'upcoming' && k !== null && k < 0;
+            const cls = e.status === 'done' ? 'done' : (e.status === 'missed' ? 'missed' : (over ? 'over' : (k === 0 ? 'today' : '')));
+            const q = e.quest ? quests.get(e.quest) : null;
+            const meta = [e.time, e.place, e.note].filter(Boolean).map(esc).join(' · ');
+            const tags = `${e.required ? '<span class="otm-req">обязательно</span>' : ''}${q ? `<span class="otm-qlink">🔗 ${esc(q.title)}</span>` : ''}`;
+            const status = e.status === 'done' ? '✔ состоялось' : (e.status === 'missed' ? '✖ пропущено' : (over ? '⏳ ждёт итогов' : rel(e.day, now)));
+            return `<div class="otm-ev ${cls}"><div class="otm-evd"><b>${e.day != null ? fmtDay(e.day) : '—'}</b><small>${status}</small></div><div class="otm-evb"><b>${EV_ICON[e.type] || '✦'} ${esc(e.title)}</b>${meta ? `<small>${meta}</small>` : ''}${tags ? `<div class="otm-evt">${tags}</div>` : ''}</div>${e.status === 'upcoming' ? `<button class="otm-mini-btn" data-act="evgo" data-id="${esc(e.id)}">➜</button>` : ''}</div>`;
+        };
+        const shown = (calSel != null ? events.filter(e => e.day === calSel) : events).slice().sort((a, b) => (a.day ?? 1e9) - (b.day ?? 1e9));
+        const up = shown.filter(e => e.status === 'upcoming');
+        const res = shown.filter(e => e.status !== 'upcoming');
+        const [se] = seasonOf(fmtFull(now), '');
+        return `<div class="otm-calhead"><button class="otm-mini-btn" data-act="calprev">‹</button><div><b>${MONTHS[m]} ${y}</b><small>${se} сегодня ${fmtFull(now)}</small></div><button class="otm-mini-btn" data-act="calnext">›</button></div>
+            <div class="otm-grid">${head}${cells}</div>
+            ${calSel != null ? `<div class="otm-sec">События дня ${fmtDay(calSel)} <button class="otm-mini-btn" data-act="calclear">показать все</button></div>` : section('Предстоящее')}
+            ${up.map(row).join('') || '<div class="otm-none">На этот день ничего не запланировано</div>'}
+            ${res.length ? section('Прошедшее') + res.map(row).join('') : ''}
+            <div class="otm-foot"><span>Дата берётся из инфоблока</span><button class="otm-btn" data-act="update">🔄 Обновить</button></div>`;
     }
 
     let paperIdx = 0;
@@ -807,6 +980,8 @@ JSON SHAPE:
     function openPanel() {
         document.getElementById('otm-modal')?.classList.remove('otm-hidden');
         unseen = false;
+        calOff = 0;
+        calSel = null;
         updateFabDot();
         render();
     }
@@ -861,6 +1036,32 @@ JSON SHAPE:
                 const ta = document.getElementById('send_textarea');
                 if (h && ta) {
                     ta.value = h.text;
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    closePanel();
+                    ta.focus();
+                }
+            } else if (act === 'calprev') {
+                calOff--;
+                render();
+            } else if (act === 'calnext') {
+                calOff++;
+                render();
+            } else if (act === 'calday') {
+                const d = Number(el.dataset.day);
+                calSel = (calSel === d) ? null : d;
+                render();
+            } else if (act === 'calclear') {
+                calSel = null;
+                render();
+            } else if (act === 'evgo') {
+                const st0 = getState();
+                const e = st0?.calendar?.events?.find(x => x.id === el.dataset.id);
+                const ta = document.getElementById('send_textarea');
+                if (e && ta) {
+                    const n0 = nowDay(st0);
+                    const k = (e.day != null && n0 != null) ? e.day - n0 : null;
+                    const where = e.place ? ` (${e.place})` : '';
+                    ta.value = (k !== null && k <= 0) ? `Наступил день события: «${e.title}»${where}.` : `Приближается событие: «${e.title}»${where}, ${rel(e.day, n0)}. Я готовлюсь.`;
                     ta.dispatchEvent(new Event('input', { bubbles: true }));
                     closePanel();
                     ta.focus();
@@ -1011,7 +1212,7 @@ JSON SHAPE:
     // ─── init ──────────────────────────────────────────────────────────────
 
     if (globalThis.__OTOME_TEST__) {
-        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, buildPrompts, compact, cut, clean, seasonOf, lastIB, buildPaperPrompts, announce, views: { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, settings: viewSettings } });
+        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, buildPrompts, compact, cut, clean, seasonOf, lastIB, buildPaperPrompts, announce, parseDMY, nowDay, overdueNote, rel, fmtFull, monthGrid, views: { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, settings: viewSettings } });
     }
 
     jQuery(async () => {
