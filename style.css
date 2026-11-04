@@ -129,15 +129,21 @@
 }
 .otm-tabs {
     display: flex;
-    gap: 4px;
+    flex-wrap: nowrap;
+    gap: 5px;
     padding: 0 12px 10px;
     border-bottom: 1px solid var(--otm-line);
     overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    scrollbar-color: var(--otm-line2) transparent;
+    overscroll-behavior-x: contain;
 }
 .otm-tab {
-    flex: 1;
-    min-width: 0;
-    padding: 7px 4px;
+    flex: 0 0 auto;
+    min-width: max-content;
+    padding: 8px 12px;
     border: 1px solid transparent;
     border-radius: 999px;
     background: transparent;
@@ -348,3 +354,10 @@
 .otm-toast.show { opacity:1; transform:translateY(0); }.otm-toast-mark { color:var(--otm-accent); font-size:20px; }.otm-toast b,.otm-toast small { display:block; }.otm-toast b { color:var(--otm-accent); font-size:11px; letter-spacing:.12em; text-transform:uppercase; }.otm-toast small { margin-top:2px; color:#eee; font-size:12px; }
 .otm-toast.success .otm-toast-mark { color:#7bd88f; }.otm-toast.warning .otm-toast-mark { color:#ffc15e; }.otm-toast.error .otm-toast-mark { color:#ff7b7b; }
 @media (max-width:420px) { .otm-gallery { grid-template-columns:1fr; }.otm-cg-art { height:105px; } }
+
+/* Навигация с горизонтальной прокруткой: все игровые разделы доступны на узком экране. */
+.otm-tabs .otm-tab { touch-action: pan-x; }
+@media (max-width: 520px) {
+    .otm-tabs { padding-left: 10px; padding-right: 10px; gap: 4px; }
+    .otm-tab { font-size: 12px; padding: 8px 11px; }
+}
