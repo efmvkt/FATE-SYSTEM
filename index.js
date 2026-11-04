@@ -16,9 +16,13 @@
         floating: true,    // плавающая кнопка
         fullPreset: false, // обновлять через полный пресет (дороже, экспериментально)
         frozen: false,     // заморозить чувства: задания, события и память продолжают обновляться
+        theme: 'pink',     // pink | lavender | wine | auto
+        cute: true,        // милые всплывающие окна
+        mAch: true,        // достижения
+        mEnd: true,        // архив концовок
+        mCal: true,        // календарь и события
         extra: '',         // свои пожелания к Системе
         pos: null,
-        theme: 'violet',       // цветовая тема окна
     };
 
     // ─── helpers ───────────────────────────────────────────────────────────
@@ -52,22 +56,59 @@
     const turns = () => ctx().chat.filter(m => m && !m.is_user && !m.is_system).length;
 
     function toast(msg, type = 'info', force = false) {
+        if (typeof toastr === 'undefined') return;
         if (!force && !S().notify) return;
-        const host = document.getElementById('otm-toast-host') || (() => {
-            const el = document.createElement('div'); el.id = 'otm-toast-host'; document.body.appendChild(el); return el;
-        })();
-        const item = document.createElement('div');
-        item.className = `otm-toast ${['success','warning','error'].includes(type) ? type : 'info'}`;
-        item.innerHTML = `<span class="otm-toast-mark">${type === 'success' ? '✧' : type === 'warning' ? '⚠' : type === 'error' ? '✕' : '✦'}</span><span><b>Система</b><small>${esc(msg)}</small></span>`;
-        host.appendChild(item);
-        requestAnimationFrame(() => item.classList.add('show'));
-        setTimeout(() => { item.classList.remove('show'); setTimeout(() => item.remove(), 260); }, 3600);
+        toastr[type](msg, '✦ Система');
     }
 
-    function applyTheme() {
-        const modal = document.getElementById('otm-modal');
-        const theme = ['violet','rose','blue','emerald','gold','crimson'].includes(S().theme) ? S().theme : 'violet';
-        if (modal) modal.dataset.theme = theme;
+    // ─── милые всплывающие окна (как уведомления в манхве) ────────────────
+
+    const POP = {
+        quest: ['📜', 'Задание'], reward: ['🎁', 'Награда'], penalty: ['⚠️', 'Штраф'], ach: ['🏆', 'Достижение'],
+        event: ['✦', 'Событие'], stage: ['💞', 'Этап отношений'], news: ['📰', 'Газета'], stat: ['💗', 'Чувства'],
+    };
+    const LEVEL_TITLE = { minor: 'Малый штраф', major: 'Серьёзный штраф', critical: 'Критическое последствие' };
+
+    function popup(kind, text, title) {
+        if (!S().notify) return;
+        const [icon, def] = POP[kind] || POP.event;
+        if (!S().cute) { toast(`${title || def}: ${text}`, kind === 'penalty' ? 'warning' : 'info'); return; }
+        let box = document.getElementById('otm-popups');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'otm-popups';
+            document.body.appendChild(box);
+        }
+        const el = document.createElement('div');
+        el.className = `otm-pop otm-pop-${kind}`;
+        el.innerHTML = `<span class="otm-pop-ic">${icon}</span><div class="otm-pop-tx"><b>${esc(title || def)}</b><span>${esc(text)}</span></div><i class="otm-spark">✧</i><i class="otm-spark s2">✦</i>`;
+        el.addEventListener('click', () => el.remove());
+        box.appendChild(el);
+        setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 450); }, 5000);
+        while (box.children.length > 4) box.firstChild.remove();
+    }
+
+    // что показать после обновления: сравниваем старое состояние с новым
+    function announce(old, st, events, fresh) {
+        if (!old) { popup('stage', st.stage || 'Система создана', 'Система запущена ✦'); return; }
+        const out = [];
+        const oldQ = new Map(old.quests.map(q => [q.id, q]));
+        for (const q of st.quests) {
+            const o = oldQ.get(q.id);
+            if (!o && q.status === 'active') out.push(['quest', `«${q.title}»`, 'Новое задание!']);
+            else if (o && o.status === 'locked' && q.status === 'active') out.push(['quest', `«${q.title}»`, 'Скрытое задание открыто!']);
+            else if (o && o.status === 'active' && q.status === 'done') out.push(['reward', `«${q.title}»${q.reward ? ' — ' + q.reward : ''}`, 'Задание выполнено!']);
+            else if (o && o.status === 'active' && q.status === 'failed') out.push(['penalty', `«${q.title}»${q.penalty ? ' — ' + q.penalty : ''}`, 'Задание провалено']);
+        }
+        if (st.stage && old.stage && st.stage !== old.stage) out.push(['stage', st.stage, 'Этап отношений изменился']);
+        st.stats.filter(x => Math.abs(x.value - x.prev) >= 6).slice(0, 2).forEach(x => {
+            const d = x.value - x.prev;
+            out.push(['stat', `${x.icon} ${x.name} ${d > 0 ? '+' : ''}${d}`, d > 0 ? 'Чувства растут' : 'Чувства остывают']);
+        });
+        for (const e of events) if (e.type === 'penalty') out.push(['penalty', e.text, LEVEL_TITLE[e.level] || 'Штраф']);
+        (fresh?.ach || []).forEach(a => out.push(['ach', `${a.icon} ${a.title}`, 'Достижение получено!']));
+        if (st.hook && st.hook.title !== old.hook?.title) out.push(['event', st.hook.title, 'Новое событие']);
+        out.slice(0, 5).forEach(([k, text, title], i) => setTimeout(() => popup(k, text, title), i * 450));
     }
 
     function clean(t) {
@@ -101,7 +142,7 @@
 
     // ─── prompts ───────────────────────────────────────────────────────────
 
-    const SCHEMA = `{
+    const SCHEMA_BASE = `{
   "profile": "<only when creating: 5-7 sentences in Russian — who the character is, the setting, the relationship premise, his/her wounds and secrets. When updating: copy the existing profile>",
   "stage": "<short label of the current relationship stage, e.g. 'Холодное перемирие'>",
   "mood": {"emoji": "<one emoji>", "label": "<2-3 words>"},
@@ -116,12 +157,32 @@
   "events": [{"type": "quest|reward|penalty|event|moment", "level": "<only for penalty: minor|major|critical>", "text": "<one short line>"}],
   "memories": ["<only NEW durable facts: promises, conflicts, insults, gifts, secrets, confessions; max 3, one short line each>"],
   "hook": {"title": "<short>", "text": "<1-2 sentences: an event that could happen next and moves the story>"},
-  "diary": "<optional: one private diary line of the character, or empty string>",
-  "cg": [{"id":"cg1","title":"<название ключевой сцены>","quote":"<одна короткая цитата из чата>","description":"<краткое описание сцены>","turn":0}],
-  "achievements": [{"id":"a1","title":"<название>","description":"<за что получено>","rarity":"common|rare|epic|legendary","unlocked":true}],
-  "endings": [{"id":"e1","title":"<название концовки>","type":"good|bad|true|hidden|alternate","status":"locked|hinted|unlocked","hint":"<подсказка без спойлера>","description":"<краткое описание, если открыта>"}],
-  "calendar": {"date":"<игровая дата или пусто>","season":"<сезон или пусто>","events":[{"id":"c1","title":"<событие>","date":"<дата>","description":"<кратко>"}]}
+  "diary": "<optional: one private diary line of the character, or empty string>"@@EXTRA@@
 }`;
+
+    function buildSchema() {
+        const s = S();
+        let extra = '';
+        if (s.mAch) extra += `,
+  "achievements": [{"icon": "<emoji>", "title": "<short>", "desc": "<short>"}]`;
+        if (s.mEnd) extra += `,
+  "endings": [{"id": "e1", "kind": "good|neutral|bad|true", "title": "", "hint": "<what has to happen>", "progress": 0, "revealed": true}]`;
+        if (s.mCal) extra += `,
+  "calendar": {"date": "<in-story date from the chat, or Unknown>", "season": "<season or Unknown>", "upcoming": [{"title": "", "when": "<date or 'через N дней'>", "note": "<short>", "source": "story|suggested"}]}`;
+        return SCHEMA_BASE.replace('@@EXTRA@@', extra);
+    }
+
+    function moduleRules() {
+        const s = S();
+        let r = '';
+        if (s.mAch) r += `- achievements: only NEW ones clearly earned in the recent chat (a first fight, a confession, a revealed secret, a kept promise...). Usually zero, max 2. Never repeat existing ones.
+`;
+        if (s.mEnd) r += `- endings: 3-5 possible story directions (tendencies, not scripts; do not spoil). Keep ids stable. progress 0-100 = how close the story is to each right now. A "true" ending stays revealed=false until the story has clearly opened it. Set "ending" to the one-line direction of the leading route.
+`;
+        if (s.mCal) r += `- calendar: up to 5 upcoming dated events: those already mentioned in the chat or card (source "story") and at most 2 plausible seasonal or social ones for this world (source "suggested": a ball, a holiday, a birthday, a departure). Use the in-story date from the chat.
+`;
+        return r;
+    }
 
     function compact(st) {
         if (!st) return null;
@@ -135,10 +196,9 @@
             })),
             rules: st.rules,
             memories: (st.memories || []).slice(0, 8).map(m => m.text),
-            cg: (st.cg || []).slice(0, 12),
-            achievements: (st.achievements || []).slice(0, 30),
-            endings: (st.endings || []).slice(0, 12),
-            calendar: st.calendar || { date: '', season: '', events: [] },
+            ...(S().mAch ? { achievements: (st.achievements || []).slice(0, 12).map(a => a.title) } : {}),
+            ...(S().mEnd ? { endings: (st.endings || []).map(e => ({ id: e.id, kind: e.kind, title: e.title, progress: e.progress, revealed: e.revealed })) } : {}),
+            ...(S().mCal ? { calendar: st.calendar || null } : {}),
         };
     }
 
@@ -190,14 +250,10 @@ RULES:
 - penalties must follow from what really happened and carry a level in the event: "minor" (mood, small loss), "major" (plot consequence), "critical" (irreversible turn). Never punish merely for ignoring a quest without consequences in the story.
 - memories: durable facts worth remembering 100 messages later; never repeat ones already listed.
 - hook: one event that could plausibly happen next (a letter, a visit, news, a conflict). It must move the story, not only the romance.
-- Do not invent facts that contradict the chat. No meta commentary.
-- cg: add only genuinely pivotal scenes clearly present in the chat; preserve existing ids and never duplicate a scene. Save a short exact quote from the chat when possible. Maximum 12 entries; do not invent images or image URLs.
-- achievements: unlock only for events explicitly confirmed by the chat; preserve unlocked achievements and stable ids. Hidden achievements stay absent until discovered. Maximum 30 entries.
-- endings: track plausible route outcomes from established story evidence. Do not mark an ending unlocked unless the story has actually reached it. Use locked/hinted/unlocked and spoiler-light hints. Do not infer endings from affection values alone. Preserve existing ids; maximum 12.
-- calendar: only use dates, seasons, birthdays, balls and other events established by the story. Do not invent a current date; leave date/season empty when unknown. Preserve known upcoming events.
+${moduleRules()}- Do not invent facts that contradict the chat. No meta commentary.
 
 JSON SHAPE:
-${SCHEMA}`;
+${buildSchema()}`;
         return { system, prompt: p };
     }
 
@@ -259,6 +315,10 @@ ${SCHEMA}`;
             log: old?.log ? [...old.log] : [],
             diary: old?.diary ? [...old.diary] : [],
             memories: old?.memories ? [...old.memories] : [],
+            achievements: old?.achievements ? [...old.achievements] : [],
+            endings: old?.endings || [],
+            calendar: old?.calendar || null,
+            papers: old?.papers || [],
             hook: null,
             lastTurn: t,
             updatedAt: Date.now(),
@@ -316,33 +376,39 @@ ${SCHEMA}`;
         st.memories = st.memories.slice(0, 40);
         if (str(raw.hook?.text)) st.hook = { title: str(raw.hook.title) || 'Событие', text: str(raw.hook.text) };
 
-        // Дополнительные игровые коллекции. Существующие записи сохраняются по id.
-        const mergeById = (incoming, previous, limit, mapItem) => {
-            const prev = Array.isArray(previous) ? previous : [];
-            const out = [...prev];
-            for (const item of arr(incoming).slice(0, limit)) {
-                const mapped = mapItem(item);
-                if (!mapped.id || !mapped.title) continue;
-                const idx = out.findIndex(x => x.id === mapped.id);
-                if (idx >= 0) {
-                    const previous = out[idx];
-                    const merged = { ...previous, ...mapped };
-                    // Открытые достижения и концовки — постоянная история, модель не может закрыть их повторно.
-                    if ('unlocked' in previous && previous.unlocked === true) merged.unlocked = true;
-                    if (previous.status === 'unlocked') merged.status = 'unlocked';
-                    if (previous.status === 'hinted' && mapped.status === 'locked') merged.status = 'hinted';
-                    out[idx] = merged;
-                } else out.unshift(mapped);
+        const fresh2 = { ach: [] };
+        if (S().mAch) {
+            const haveA = new Set(st.achievements.map(a => a.title.toLowerCase()));
+            for (const a of arr(raw.achievements).slice(0, 2)) {
+                const title = str(a?.title);
+                if (!title || haveA.has(title.toLowerCase())) continue;
+                const item = { turn: t, icon: str(a?.icon) || '🏆', title, desc: str(a?.desc) };
+                st.achievements.unshift(item);
+                fresh2.ach.push(item);
+                haveA.add(title.toLowerCase());
             }
-            return out.slice(0, limit);
-        };
-        st.cg = mergeById(raw.cg, old?.cg, 12, x => ({ id: str(x?.id), title: str(x?.title), quote: str(x?.quote), description: str(x?.description), turn: clamp(Math.round(Number(x?.turn) || t), 0, t) }));
-        st.achievements = mergeById(raw.achievements, old?.achievements, 30, x => ({ id: str(x?.id), title: str(x?.title), description: str(x?.description), rarity: ['common','rare','epic','legendary'].includes(x?.rarity) ? x.rarity : 'common', unlocked: x?.unlocked === true }));
-        st.endings = mergeById(raw.endings, old?.endings, 12, x => ({ id: str(x?.id), title: str(x?.title), type: ['good','bad','true','hidden','alternate'].includes(x?.type) ? x.type : 'alternate', status: ['hinted','unlocked'].includes(x?.status) ? x.status : 'locked', hint: str(x?.hint), description: str(x?.description) }));
-        const cal = raw.calendar && typeof raw.calendar === 'object' ? raw.calendar : {};
-        st.calendar = { date: str(cal.date) || old?.calendar?.date || '', season: str(cal.season) || old?.calendar?.season || '', events: mergeById(cal.events, old?.calendar?.events, 30, x => ({ id: str(x?.id), title: str(x?.title), date: str(x?.date), description: str(x?.description) })) };
+            st.achievements = st.achievements.slice(0, 60);
+        }
+        if (S().mEnd && Array.isArray(raw.endings) && raw.endings.length) {
+            st.endings = raw.endings.slice(0, 5).map((e, i) => ({
+                id: str(e?.id) || ('e' + (i + 1)),
+                kind: ['good', 'neutral', 'bad', 'true'].includes(e?.kind) ? e.kind : 'neutral',
+                title: str(e?.title), hint: str(e?.hint),
+                progress: clamp(Math.round(Number(e?.progress)) || 0, 0, 100),
+                revealed: e?.revealed !== false,
+            })).filter(e => e.title);
+        }
+        if (S().mCal && raw.calendar && typeof raw.calendar === 'object') {
+            st.calendar = {
+                date: str(raw.calendar.date), season: str(raw.calendar.season),
+                upcoming: arr(raw.calendar.upcoming).slice(0, 5).map(u => ({
+                    title: str(u?.title), when: str(u?.when), note: str(u?.note),
+                    source: u?.source === 'suggested' ? 'suggested' : 'story',
+                })).filter(u => u.title),
+            };
+        }
 
-        return { st, events };
+        return { st, events, fresh: fresh2 };
     }
 
     function applyInjection() {
@@ -357,7 +423,8 @@ ${SCHEMA}`;
             const goals = st.quests.filter(q => q.status === 'active').slice(0, 3).map(q => q.title).join('; ');
             const stats = st.stats.map(x => `${x.name} ${x.value}/100`).join(', ');
             const name = c.name2 || 'the character';
-            const txt = `[Hidden story state of ${name}. Never mention it, the numbers or any "system" in the text — just let it quietly steer ${name}'s behavior and replies. Relationship stage: ${st.stage}. Mood: ${st.mood.label}. Outwardly: ${st.shows}. Secretly: ${st.hides}. ${stats}. Current goals: ${goals}.]`;
+            const up = (s.mCal && st.calendar?.upcoming?.length) ? ` Upcoming events: ${st.calendar.upcoming.slice(0, 2).map(u => `${u.title} (${u.when})`).join('; ')}.` : '';
+            const txt = `[Hidden story state of ${name}. Never mention it, the numbers or any "system" in the text — just let it quietly steer ${name}'s behavior and replies. Relationship stage: ${st.stage}. Mood: ${st.mood.label}. Outwardly: ${st.shows}. Secretly: ${st.hides}. ${stats}. Current goals: ${goals}.${up}]`;
             c.setExtensionPrompt(EXT, txt, 1, 1);
         } catch (e) {
             console.warn(`[${EXT}] inject failed`, e);
@@ -388,14 +455,12 @@ ${SCHEMA}`;
                 toast('Не удалось получить ответ модели. Проверьте API или выключите режим полного пресета.', 'error', true);
                 return false;
             }
-            const { st, events } = normalize(raw, old);
+            const { st, events, fresh } = normalize(raw, old);
             const cur = getState();
             st.prev = cur ? snapshot(cur) : null;
             setState(st);
             applyInjection();
-            for (const e of events) {
-                toast(e.text, e.type === 'penalty' ? 'warning' : (e.type === 'reward' ? 'success' : 'info'));
-            }
+            announce(old, st, events, fresh);
             if (!isOpen()) { unseen = true; updateFabDot(); }
             render();
             return true;
@@ -403,6 +468,67 @@ ${SCHEMA}`;
             console.error(`[${EXT}]`, e);
             toast('Ошибка обновления Системы, подробности в консоли.', 'error', true);
             return false;
+        } finally {
+            busy = false;
+            setBusyUI(false);
+        }
+    }
+
+    function buildPaperPrompts(st, full) {
+        const c = ctx();
+        const cn = c.name2 || 'Character';
+        const un = c.name1 || 'User';
+        const system = `You are the editor of the gossip newspaper of this story's world. You write the latest issue. Reply with ONE valid JSON object only: no markdown, no text outside the JSON. All text values in Russian.`;
+        const prevTitles = (st.papers || []).slice(0, 2).flatMap(p => p.headlines.map(h => h.title)).join(' | ');
+        let p = `CHARACTER PROFILE (${cn}): ${st.profile || ''}\n`;
+        p += `PLAYER PERSONA: ${un}\nRELATIONSHIP STAGE: ${st.stage}\n`;
+        if (st.calendar?.date) p += `IN-STORY DATE: ${st.calendar.date}${st.calendar.season ? ', ' + st.calendar.season : ''}\n`;
+        p += `ACTIVE PLOT THREADS: ${st.quests.filter(q => q.status === 'active').map(q => q.title).join('; ') || 'none'}\n`;
+        if (prevTitles) p += `ALREADY PRINTED (do not repeat): ${prevTitles}\n`;
+        if (S().extra.trim()) p += `PLAYER'S WISHES: ${S().extra.trim()}\n`;
+        p += full ? '\nThe recent chat is the conversation above.\n' : `\nRECENT CHAT:\n${recent(6, 900)}\n`;
+        p += `
+TASK: write a new issue of the gossip paper.
+RULES:
+- 5-6 items. At least 3 are about the wider world and have NOTHING to do with the protagonists: politics, borders and war, the economy, weather, crime, fashion, culture, other noble houses or other circles of this setting.
+- 1-2 items are gossip about ${un} and ${cn}, based ONLY on what could plausibly have been witnessed in the recent chat. Gossip may be exaggerated or distorted (truth "rumor" or "scandal"); world news is "fact".
+- Everything must fit the setting and not contradict the chat or the profile. The paper's name, tone and sections must feel native to this world.
+- Short: each text is 1-3 sentences. End with one tiny funny classified ad. Nothing explicit.
+
+JSON SHAPE:
+{"paper": "<name of the newspaper>", "date": "<date of the issue in the world's style or empty>", "headlines": [{"section": "<section name>", "title": "<headline>", "text": "<1-3 sentences>", "truth": "fact|rumor|scandal"}], "ad": "<classified ad>"}`;
+        return { system, prompt: p };
+    }
+
+    async function runPaper() {
+        if (busy) return;
+        const st = getState();
+        if (!st) return;
+        busy = true;
+        setBusyUI(true);
+        try {
+            const { system, prompt } = buildPaperPrompts(st, S().fullPreset);
+            const raw = await callLLM(system, prompt, S().fullPreset);
+            if (!raw || !Array.isArray(raw.headlines) || !raw.headlines.length) {
+                toast('Газета не вышла: модель не вернула номер. Попробуйте ещё раз.', 'error', true);
+                return;
+            }
+            const issue = {
+                turn: turns(), paper: str(raw.paper), date: str(raw.date), ad: str(raw.ad),
+                headlines: raw.headlines.slice(0, 7).map(h => ({
+                    section: str(h?.section) || 'Новости', title: str(h?.title), text: str(h?.text),
+                    truth: ['fact', 'rumor', 'scandal'].includes(h?.truth) ? h.truth : 'rumor',
+                })).filter(h => h.title),
+            };
+            const cur = getState() || st;
+            cur.papers = [issue, ...(cur.papers || [])].slice(0, 6);
+            setState(cur);
+            paperIdx = 0;
+            popup('news', issue.paper || 'Свежий номер', 'Вышел свежий номер!');
+            render();
+        } catch (e) {
+            console.error(`[${EXT}]`, e);
+            toast('Ошибка выпуска газеты, подробности в консоли.', 'error', true);
         } finally {
             busy = false;
             setBusyUI(false);
@@ -424,7 +550,7 @@ ${SCHEMA}`;
                 q.status = 'failed';
                 q.dueTurn = null;
                 st.log.unshift({ turn: t, type: 'penalty', text: `Время вышло: «${q.title}». Штраф: ${q.penalty || '—'}` });
-                toast(`Время вышло: «${q.title}». Штраф: ${q.penalty || '—'}`, 'warning');
+                popup('penalty', `Время вышло: «${q.title}». Штраф: ${q.penalty || '—'}`, 'Задание просрочено');
             }
             note = `The timer just failed these quests: ${expired.map(q => `"${q.title}" (penalty: ${q.penalty})`).join('; ')}. Lower the related stats accordingly, but do NOT add events for them (already logged).`;
             setState(st);
@@ -466,6 +592,15 @@ ${SCHEMA}`;
         return h < 24 ? `${h} ч назад` : `${Math.round(h / 24)} дн назад`;
     }
 
+    function portrait() {
+        const c = ctx();
+        const ch = c.characters?.[c.characterId];
+        if (!ch?.avatar) return '<div class="otm-portrait-wrap"><span class="otm-noimg">✦</span></div>';
+        let url = `/thumbnail?type=avatar&file=${encodeURIComponent(ch.avatar)}`;
+        try { if (typeof c.getThumbnailUrl === 'function') url = c.getThumbnailUrl('avatar', ch.avatar) || url; } catch (e) { /* запасной адрес */ }
+        return `<div class="otm-portrait-wrap"><span class="otm-noimg">✦</span><img class="otm-portrait" src="${esc(url)}" alt="" onerror="this.remove()"></div>`;
+    }
+
     function viewStatus(st) {
         if (!st) return emptyView();
         const name = esc(ctx().name2 || 'Персонаж');
@@ -478,12 +613,10 @@ ${SCHEMA}`;
             </div>`;
         }).join('');
         const choices = st.choices.map((x, i) => `<button class="otm-choice" data-act="choice" data-i="${i}">${esc(x)}</button>`).join('');
-        const avatar = characterAvatar();
         return `
-            <div class="otm-character-banner">${avatar ? `<img src="${esc(avatar)}" alt="">` : '<span>✦</span>'}<div><b>${name}</b><small>${esc(st.stage || 'История продолжается')}</small></div></div>
             <div class="otm-mood">
-                <span class="otm-emoji">${esc(st.mood.emoji)}</span>
-                <div><div class="otm-mlabel">${esc(st.mood.label)}</div><div class="otm-stage">${esc(st.stage)}</div></div>
+                ${portrait()}
+                <div class="otm-mtext"><div class="otm-cname">${name}</div><div class="otm-mlabel">${esc(st.mood.emoji)} ${esc(st.mood.label)}</div><div class="otm-stage">${esc(st.stage)}</div></div>
             </div>
             <div class="otm-sec">Чувства</div>
             ${stats}
@@ -527,49 +660,105 @@ ${SCHEMA}`;
     const LOG_ICON = { reward: '🎁', penalty: '⚠️', quest: '📜', event: '✦', moment: '💫' };
     const LEVEL = { minor: 'МАЛЫЙ ШТРАФ', major: 'СЕРЬЁЗНЫЙ ШТРАФ', critical: 'КРИТИЧЕСКИЙ' };
 
+    function section(title) { return `<div class="otm-sec">${title}</div>`; }
+
     function viewLog(st) {
         if (!st) return emptyView();
-        if (!st.log.length) return '<div class="otm-none">Пока пусто. События появятся после обновлений.</div>';
-        return st.log.slice(0, 50).map(e => `<div class="otm-log ${e.type}"><span>${LOG_ICON[e.type] || '✦'}</span><div>${e.level ? `<b class="otm-lv ${e.level}">${LEVEL[e.level]}</b> ` : ''}${esc(e.text)}<small>ход ${e.turn}</small></div></div>`).join('');
+        const ev = st.log.slice(0, 30).map(e => `<div class="otm-log ${e.type}"><span>${LOG_ICON[e.type] || '✦'}</span><div>${e.level ? `<b class="otm-lv ${e.level}">${LEVEL[e.level]}</b> ` : ''}${esc(e.text)}<small>ход ${e.turn}</small></div></div>`).join('');
+        const mem = (st.memories || []).slice(0, 15).map(e => `<div class="otm-mem">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('');
+        const dia = (st.diary || []).slice(0, 10).map(e => `<div class="otm-dia">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('');
+        return `${section('События')}${ev || '<div class="otm-none">Пока пусто</div>'}${mem ? section('Память: обещания, конфликты, секреты') + mem : ''}${dia ? section('Дневник героя') + dia : ''}`;
     }
 
-    function viewDiary(st) {
-        if (!st) return emptyView();
-        const mem = st.memories || [];
-        const dia = st.diary || [];
-        if (!mem.length && !dia.length) return '<div class="otm-none">Пока пусто. Сюда попадают обещания, конфликты, секреты и личные записи героя.</div>';
-        return `${mem.length ? `<div class="otm-sec">Память: обещания, конфликты, секреты</div>${mem.map(e => `<div class="otm-mem">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('')}` : ''}
-            ${dia.length ? `<div class="otm-sec">Дневник героя</div>${dia.map(e => `<div class="otm-dia">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('')}` : ''}`;
+    // последняя строка локации из инфоблока [IB] в чате: дата, время, место, погода (бесплатно, без запросов)
+    function lastIB() {
+        const chat = ctx().chat || [];
+        for (let i = chat.length - 1; i >= Math.max(0, chat.length - 8); i--) {
+            const m = chat[i];
+            if (!m || m.is_user) continue;
+            const mm = String(m.mes || '').match(/\[IB\]([\s\S]*?)\[\/IB\]/i);
+            if (!mm) continue;
+            const line = mm[1].split('\n').map(x => x.trim()).find(x => /^L:/i.test(x));
+            if (line) {
+                const p = line.slice(2).split('|').map(x => x.trim());
+                return { loc: p[0] || '', date: p[1] || '', time: p[2] || '', weather: p[3] || '' };
+            }
+        }
+        return null;
     }
 
-    function characterAvatar() {
-        const c = ctx(); const ch = c.characters?.[c.characterId];
-        const avatar = field(ch, 'avatar');
-        if (!avatar || avatar === 'none') return '';
-        try { return typeof getThumbnailUrl === 'function' ? getThumbnailUrl('avatar', avatar) : `/characters/${encodeURIComponent(avatar)}`; }
-        catch { return ''; }
+    function seasonOf(date, fallback) {
+        const m = String(date || '').match(/\b(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{2,4})\b/);
+        if (m) {
+            const mon = Number(m[2]);
+            if (mon === 12 || (mon >= 1 && mon <= 2)) return ['❄️', 'Зима'];
+            if (mon >= 3 && mon <= 5) return ['🌸', 'Весна'];
+            if (mon >= 6 && mon <= 8) return ['☀️', 'Лето'];
+            if (mon >= 9 && mon <= 11) return ['🍂', 'Осень'];
+        }
+        const f = String(fallback || '');
+        if (/зим|winter/i.test(f)) return ['❄️', 'Зима'];
+        if (/весн|spring/i.test(f)) return ['🌸', 'Весна'];
+        if (/лет[оа]|summer/i.test(f)) return ['☀️', 'Лето'];
+        if (/осен|autumn|fall/i.test(f)) return ['🍂', 'Осень'];
+        return ['✦', ''];
     }
 
-    function viewCG(st) {
-        if (!st) return emptyView();
-        const items = st.cg || [];
-        return items.length ? `<div class="otm-gallery">${items.map(x => `<article class="otm-cg"><div class="otm-cg-art">✦</div><b>${esc(x.title)}</b><blockquote>«${esc(x.quote || '…')}»</blockquote><p>${esc(x.description)}</p><small>Ход ${x.turn}</small></article>`).join('')}</div>` : '<div class="otm-none">Здесь появятся важные сцены вашей истории — Система сохранит их после подтверждения в переписке.</div>';
-    }
-    function viewAchievements(st) {
-        if (!st) return emptyView();
-        const items = st.achievements || []; const unlocked = items.filter(x => x.unlocked);
-        return `<div class="otm-sec">Открыто: ${unlocked.length}</div>${unlocked.length ? unlocked.map(x => `<div class="otm-ach ${esc(x.rarity)}"><span>🏅</span><div><b>${esc(x.title)}</b><small>${esc(x.description)}</small></div><i>${esc(x.rarity)}</i></div>`).join('') : '<div class="otm-none">Пока нет открытых достижений. Скрытые не показываются до обнаружения.</div>'}`;
-    }
-    function viewEndings(st) {
-        if (!st) return emptyView();
-        const items = st.endings || [];
-        const labels = { good: 'Хорошая', bad: 'Плохая', true: 'Истинная', hidden: 'Скрытая', alternate: 'Альтернативная' };
-        return items.length ? items.map(x => `<div class="otm-ending-card ${x.status === 'unlocked' ? 'opened' : ''}"><div><b>${x.status === 'locked' ? '???' : esc(x.title)}</b><span>${labels[x.type] || 'Маршрут'} · ${x.status === 'unlocked' ? 'Открыта' : x.status === 'hinted' ? 'Есть подсказка' : 'Закрыта'}</span></div><p>${x.status === 'unlocked' ? esc(x.description) : esc(x.hint || 'Пока нет подсказок.')}</p></div>`).join('') : '<div class="otm-none">Архив концовок пока пуст. Система будет добавлять маршруты только по мере развития сюжета.</div>';
-    }
     function viewCalendar(st) {
         if (!st) return emptyView();
-        const cal = st.calendar || {}; const events = cal.events || [];
-        return `<div class="otm-calendar-head"><span>📅</span><div><b>${esc(cal.date || 'Дата не установлена')}</b><small>${esc(cal.season || 'Сезон неизвестен')}</small></div></div>${events.length ? events.map(x => `<div class="otm-cal-event"><b>${esc(x.title)}</b><span>${esc(x.date || 'Дата не указана')}</span><p>${esc(x.description)}</p></div>`).join('') : '<div class="otm-none">События календаря появятся, когда даты и праздники будут установлены в истории.</div>'}`;
+        const ib = lastIB();
+        const cal = st.calendar || {};
+        const date = ib?.date || cal.date || '';
+        const [se, sn] = seasonOf(date, cal.season);
+        const sub = [sn, ib?.time, ib?.loc, ib?.weather].filter(Boolean).map(esc).join(' · ');
+        const up = (cal.upcoming || []).map(u => `<div class="otm-ev"><span class="otm-evw">${esc(u.when)}</span><div><b>${esc(u.title)}</b>${u.note ? `<small>${esc(u.note)}</small>` : ''}</div><i class="otm-src ${u.source}">${u.source === 'suggested' ? 'идея' : 'сюжет'}</i></div>`).join('');
+        return `<div class="otm-cal"><div class="otm-season">${se}</div><div><div class="otm-date">${esc(date || 'Дата неизвестна')}</div><div class="otm-calsub">${sub}</div></div></div>
+            ${section('Ближайшие события')}${up || '<div class="otm-none">Событий пока нет. Они появятся после обновления Системы.</div>'}
+            <div class="otm-hint">Дата, время и место берутся из инфоблока последнего ответа.</div>`;
+    }
+
+    let paperIdx = 0;
+    const TRUTH = { fact: 'ФАКТ', rumor: 'СЛУХ', scandal: 'СКАНДАЛ' };
+
+    function viewNews(st) {
+        if (!st) return emptyView();
+        const papers = st.papers || [];
+        const btn = '<button class="otm-btn otm-primary" data-act="paper">📰 Выпустить свежий номер</button>';
+        if (!papers.length) {
+            return `<div class="otm-empty"><div class="otm-big">📰</div><div class="otm-etitle">Сплетник</div><div class="otm-edesc">Газета этого мира: новости двора, армии и города плюс слухи о вас. Выходит только по вашему запросу.</div>${btn}</div>`;
+        }
+        paperIdx = Math.min(Math.max(0, paperIdx), papers.length - 1);
+        const p = papers[paperIdx];
+        const items = p.headlines.map((h, j) => `<article class="otm-news ${esc(h.truth)}">
+            <div class="otm-nh"><span class="otm-sectag">${esc(h.section)}</span><span class="otm-truth ${esc(h.truth)}">${TRUTH[h.truth] || 'СЛУХ'}</span></div>
+            <h4>${esc(h.title)}</h4><p>${esc(h.text)}</p>
+            <button class="otm-mini-btn" data-act="news" data-i="${paperIdx}" data-j="${j}">➜ в сюжет</button></article>`).join('');
+        return `<div class="otm-paper">
+            <div class="otm-mast">${esc(p.paper || 'Вестник')}</div>
+            <div class="otm-issue">${esc(p.date || '')}${p.date ? ' · ' : ''}ход ${p.turn}</div>
+            ${items}${p.ad ? `<div class="otm-ad">${esc(p.ad)}</div>` : ''}
+            </div>
+            <div class="otm-pager"><button class="otm-mini-btn" data-act="pprev" ${paperIdx >= papers.length - 1 ? 'disabled' : ''}>‹ раньше</button><span>${paperIdx + 1} / ${papers.length}</span><button class="otm-mini-btn" data-act="pnext" ${paperIdx <= 0 ? 'disabled' : ''}>новее ›</button></div>
+            <div class="otm-foot2">${btn}</div>`;
+    }
+
+    function viewCollection(st) {
+        if (!st) return emptyView();
+        const achs = st.achievements || [];
+        const ach = achs.map(a => `<div class="otm-ach"><span>${esc(a.icon)}</span><div><b>${esc(a.title)}</b><small>${esc(a.desc)} · ход ${a.turn}</small></div></div>`).join('');
+        return `${section(`Достижения · ${achs.length}`)}${ach || '<div class="otm-none">Пока ни одного. Всё впереди ✦</div>'}`;
+    }
+
+    const KIND = { good: 'ХОРОШАЯ', neutral: 'НЕЙТРАЛЬНАЯ', bad: 'ПЛОХАЯ', true: 'ИСТИННАЯ' };
+
+    function viewEndings(st) {
+        if (!st) return emptyView();
+        const list = [...(st.endings || [])].sort((a, b) => b.progress - a.progress);
+        if (!list.length) return `<div class="otm-none">${st.ending ? esc(st.ending) : 'Направления появятся после обновления Системы.'}</div>`;
+        return list.map(e => e.revealed
+            ? `<div class="otm-end ${e.kind}"><div class="otm-qh"><span class="otm-chip">${KIND[e.kind]}</span><span class="otm-due">${e.progress}%</span></div><div class="otm-qt">${esc(e.title)}</div><div class="otm-qd">${esc(e.hint)}</div><div class="otm-bar"><i style="width:${e.progress}%"></i></div></div>`
+            : `<div class="otm-end otm-locked"><div class="otm-qh"><span class="otm-chip">${KIND[e.kind]}</span></div><div class="otm-qt">🔒 ???</div><div class="otm-qd">Эта концовка ещё не открыта</div></div>`).join('')
+            + '<div class="otm-hint">Это тенденции, а не жёсткие сценарии: история может свернуть куда угодно.</div>';
     }
 
     function viewSettings() {
@@ -581,10 +770,14 @@ ${SCHEMA}`;
             ${chk('auto', 'Автообновление', 'Отдельный запрос к модели раз в несколько ответов')}
             <label class="otm-row"><span>Обновлять каждые <input type="number" min="1" max="20" data-set="every" value="${s.every}" class="otm-num"> ответов</span></label>
             ${chk('frozen', 'Заморозить чувства', 'Настроение, показатели и мысли не меняются. Задания, события и память обновляются')}
+            <label class="otm-row otm-sel"><span>Тема окна</span><select data-set="theme" class="otm-select">${[['pink', 'Розовая'], ['lavender', 'Лавандовая'], ['wine', 'Винная'], ['auto', 'От темы ST']].map(([v, l]) => `<option value="${v}" ${s.theme === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+            ${chk('cute', 'Милые всплывающие окна', 'Как уведомления в манхве. Выключите, чтобы получать обычные окна таверны')}
+            ${chk('mAch', 'Достижения', 'Входят в обновления, добавляют немного токенов')}
+            ${chk('mEnd', 'Архив концовок')}
+            ${chk('mCal', 'Календарь и события')}
             ${chk('inject', 'Подмешивать состояние в промпт', 'Персонаж ведёт себя по настроению и чувствам (около 80 токенов)')}
             ${chk('notify', 'Всплывающие уведомления')}
             ${chk('floating', 'Плавающая кнопка на экране')}
-            <label class="otm-row otm-theme-row"><span>Цветовая тема<small>Меняет только оформление окна Системы</small></span><select data-set="theme" class="otm-theme-select">${[['violet','Аметист'],['rose','Розовая'],['blue','Сапфир'],['emerald','Изумруд'],['gold','Золото'],['crimson','Рубин']].map(([v,n]) => `<option value="${v}" ${s.theme===v?'selected':''}>${n}</option>`).join('')}</select></label>
             ${chk('fullPreset', 'Обновлять через полный пресет', 'Дороже по токенам, экспериментально. Нужно, если модель отказывается от обновлений без пресета')}
             <div class="otm-sec">Пожелания к Системе</div>
             <textarea class="otm-ta" data-set="extra" rows="3" placeholder="Например: больше интриг, жёстче штрафы, следить за ревностью">${esc(s.extra)}</textarea>
@@ -604,12 +797,11 @@ ${SCHEMA}`;
         const body = document.getElementById('otm-body');
         if (!body) return;
         const st = getState();
-        const views = { status: viewStatus, quests: viewQuests, cg: viewCG, achievements: viewAchievements, endings: viewEndings, calendar: viewCalendar, log: viewLog, diary: viewDiary };
-        body.innerHTML = tab === 'settings' ? viewSettings() : (views[tab] || viewStatus)(st);
+        const views = { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog };
+        body.innerHTML = tab === 'settings' ? viewSettings() : views[tab](st);
         document.querySelectorAll('#otm-modal .otm-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
         const sub = document.getElementById('otm-sub');
         if (sub) sub.textContent = st ? (ctx().name2 || '') : '';
-        applyTheme();
     }
 
     function openPanel() {
@@ -629,24 +821,22 @@ ${SCHEMA}`;
             <div class="otm-backdrop" data-act="close"></div>
             <div class="otm-window">
                 <div class="otm-head">
-                    <div class="otm-title">✦ СИСТЕМА <span id="otm-sub"></span><span class="otm-spin">⏳</span></div>
+                    <div class="otm-title">✦ СИСТЕМА ♡ <span id="otm-sub"></span><span class="otm-spin">⏳</span></div>
                     <button class="otm-x" data-act="close">✕</button>
                 </div>
-                <nav class="otm-tabs" aria-label="Разделы Системы">
+                <div class="otm-tabs">
                     <button class="otm-tab" data-tab="status">Статус</button>
                     <button class="otm-tab" data-tab="quests">Задания</button>
-                    <button class="otm-tab" data-tab="cg">CG-альбом</button>
-                    <button class="otm-tab" data-tab="achievements">Достижения</button>
-                    <button class="otm-tab" data-tab="endings">Концовки</button>
                     <button class="otm-tab" data-tab="calendar">Календарь</button>
+                    <button class="otm-tab" data-tab="news">Газета</button>
+                    <button class="otm-tab" data-tab="collection">Достижения</button>
+                    <button class="otm-tab" data-tab="endings">Концовки</button>
                     <button class="otm-tab" data-tab="log">Журнал</button>
-                    <button class="otm-tab" data-tab="diary">Память</button>
-                    <button class="otm-tab" data-tab="settings" aria-label="Настройки">⚙</button>
-                </nav>
+                    <button class="otm-tab" data-tab="settings">⚙</button>
+                </div>
                 <div class="otm-body" id="otm-body"></div>
             </div>`;
         document.body.appendChild(m);
-        applyTheme();
 
         m.addEventListener('click', async e => {
             const tabBtn = e.target.closest('[data-tab]');
@@ -671,6 +861,24 @@ ${SCHEMA}`;
                 const ta = document.getElementById('send_textarea');
                 if (h && ta) {
                     ta.value = h.text;
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    closePanel();
+                    ta.focus();
+                }
+            } else if (act === 'paper') {
+                await runPaper();
+            } else if (act === 'pprev') {
+                paperIdx++;
+                render();
+            } else if (act === 'pnext') {
+                paperIdx = Math.max(0, paperIdx - 1);
+                render();
+            } else if (act === 'news') {
+                const pp = getState()?.papers?.[Number(el.dataset.i)];
+                const h = pp?.headlines?.[Number(el.dataset.j)];
+                const ta = document.getElementById('send_textarea');
+                if (h && ta) {
+                    ta.value = `Я читаю «${pp.paper || 'газету'}»: ${h.title}. ${h.text}`;
                     ta.dispatchEvent(new Event('input', { bubbles: true }));
                     closePanel();
                     ta.focus();
@@ -733,8 +941,8 @@ ${SCHEMA}`;
             else if (el.type === 'number') s[k] = clamp(Math.round(Number(el.value)) || DEFAULTS[k], 1, 20);
             else s[k] = el.value;
             saveS();
-            applyFloating();
             applyTheme();
+            applyFloating();
             applyInjection();
         });
     }
@@ -751,6 +959,10 @@ ${SCHEMA}`;
         item.innerHTML = '<div class="fa-solid fa-wand-sparkles extensionsMenuExtensionButton"></div><span>Система</span>';
         item.addEventListener('click', openPanel);
         menu.appendChild(item);
+    }
+
+    function applyTheme() {
+        document.documentElement.dataset.otmTheme = S().theme || 'pink';
     }
 
     function applyFloating() {
@@ -799,11 +1011,12 @@ ${SCHEMA}`;
     // ─── init ──────────────────────────────────────────────────────────────
 
     if (globalThis.__OTOME_TEST__) {
-        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, buildPrompts, compact, cut, clean });
+        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, buildPrompts, compact, cut, clean, seasonOf, lastIB, buildPaperPrompts, announce, views: { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, settings: viewSettings } });
     }
 
     jQuery(async () => {
         const { eventSource, event_types } = ctx();
+        applyTheme();
         buildModal();
         injectMenuItem();
         applyFloating();
