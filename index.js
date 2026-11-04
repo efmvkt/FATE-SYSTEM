@@ -18,6 +18,7 @@
         frozen: false,     // заморозить чувства: задания, события и память продолжают обновляться
         extra: '',         // свои пожелания к Системе
         pos: null,
+        theme: 'violet',       // цветовая тема окна
     };
 
     // ─── helpers ───────────────────────────────────────────────────────────
@@ -51,9 +52,22 @@
     const turns = () => ctx().chat.filter(m => m && !m.is_user && !m.is_system).length;
 
     function toast(msg, type = 'info', force = false) {
-        if (typeof toastr === 'undefined') return;
         if (!force && !S().notify) return;
-        toastr[type](msg, '✦ Система');
+        const host = document.getElementById('otm-toast-host') || (() => {
+            const el = document.createElement('div'); el.id = 'otm-toast-host'; document.body.appendChild(el); return el;
+        })();
+        const item = document.createElement('div');
+        item.className = `otm-toast ${['success','warning','error'].includes(type) ? type : 'info'}`;
+        item.innerHTML = `<span class="otm-toast-mark">${type === 'success' ? '✧' : type === 'warning' ? '⚠' : type === 'error' ? '✕' : '✦'}</span><span><b>Система</b><small>${esc(msg)}</small></span>`;
+        host.appendChild(item);
+        requestAnimationFrame(() => item.classList.add('show'));
+        setTimeout(() => { item.classList.remove('show'); setTimeout(() => item.remove(), 260); }, 3600);
+    }
+
+    function applyTheme() {
+        const modal = document.getElementById('otm-modal');
+        const theme = ['violet','rose','blue','emerald','gold','crimson'].includes(S().theme) ? S().theme : 'violet';
+        if (modal) modal.dataset.theme = theme;
     }
 
     function clean(t) {
@@ -102,7 +116,11 @@
   "events": [{"type": "quest|reward|penalty|event|moment", "level": "<only for penalty: minor|major|critical>", "text": "<one short line>"}],
   "memories": ["<only NEW durable facts: promises, conflicts, insults, gifts, secrets, confessions; max 3, one short line each>"],
   "hook": {"title": "<short>", "text": "<1-2 sentences: an event that could happen next and moves the story>"},
-  "diary": "<optional: one private diary line of the character, or empty string>"
+  "diary": "<optional: one private diary line of the character, or empty string>",
+  "cg": [{"id":"cg1","title":"<название ключевой сцены>","quote":"<одна короткая цитата из чата>","description":"<краткое описание сцены>","turn":0}],
+  "achievements": [{"id":"a1","title":"<название>","description":"<за что получено>","rarity":"common|rare|epic|legendary","unlocked":true}],
+  "endings": [{"id":"e1","title":"<название концовки>","type":"good|bad|true|hidden|alternate","status":"locked|hinted|unlocked","hint":"<подсказка без спойлера>","description":"<краткое описание, если открыта>"}],
+  "calendar": {"date":"<игровая дата или пусто>","season":"<сезон или пусто>","events":[{"id":"c1","title":"<событие>","date":"<дата>","description":"<кратко>"}]}
 }`;
 
     function compact(st) {
@@ -117,6 +135,10 @@
             })),
             rules: st.rules,
             memories: (st.memories || []).slice(0, 8).map(m => m.text),
+            cg: (st.cg || []).slice(0, 12),
+            achievements: (st.achievements || []).slice(0, 30),
+            endings: (st.endings || []).slice(0, 12),
+            calendar: st.calendar || { date: '', season: '', events: [] },
         };
     }
 
@@ -169,6 +191,10 @@ RULES:
 - memories: durable facts worth remembering 100 messages later; never repeat ones already listed.
 - hook: one event that could plausibly happen next (a letter, a visit, news, a conflict). It must move the story, not only the romance.
 - Do not invent facts that contradict the chat. No meta commentary.
+- cg: add only genuinely pivotal scenes clearly present in the chat; preserve existing ids and never duplicate a scene. Save a short exact quote from the chat when possible. Maximum 12 entries; do not invent images or image URLs.
+- achievements: unlock only for events explicitly confirmed by the chat; preserve unlocked achievements and stable ids. Hidden achievements stay absent until discovered. Maximum 30 entries.
+- endings: track plausible route outcomes from established story evidence. Do not mark an ending unlocked unless the story has actually reached it. Use locked/hinted/unlocked and spoiler-light hints. Do not infer endings from affection values alone. Preserve existing ids; maximum 12.
+- calendar: only use dates, seasons, birthdays, balls and other events established by the story. Do not invent a current date; leave date/season empty when unknown. Preserve known upcoming events.
 
 JSON SHAPE:
 ${SCHEMA}`;
@@ -289,6 +315,25 @@ ${SCHEMA}`;
         }
         st.memories = st.memories.slice(0, 40);
         if (str(raw.hook?.text)) st.hook = { title: str(raw.hook.title) || 'Событие', text: str(raw.hook.text) };
+
+        // Дополнительные игровые коллекции. Существующие записи сохраняются по id.
+        const mergeById = (incoming, previous, limit, mapItem) => {
+            const prev = Array.isArray(previous) ? previous : [];
+            const out = [...prev];
+            for (const item of arr(incoming).slice(0, limit)) {
+                const mapped = mapItem(item);
+                if (!mapped.id || !mapped.title) continue;
+                const idx = out.findIndex(x => x.id === mapped.id);
+                if (idx >= 0) out[idx] = { ...out[idx], ...mapped };
+                else out.unshift(mapped);
+            }
+            return out.slice(0, limit);
+        };
+        st.cg = mergeById(raw.cg, old?.cg, 12, x => ({ id: str(x?.id), title: str(x?.title), quote: str(x?.quote), description: str(x?.description), turn: clamp(Math.round(Number(x?.turn) || t), 0, t) }));
+        st.achievements = mergeById(raw.achievements, old?.achievements, 30, x => ({ id: str(x?.id), title: str(x?.title), description: str(x?.description), rarity: ['common','rare','epic','legendary'].includes(x?.rarity) ? x.rarity : 'common', unlocked: x?.unlocked === true }));
+        st.endings = mergeById(raw.endings, old?.endings, 12, x => ({ id: str(x?.id), title: str(x?.title), type: ['good','bad','true','hidden','alternate'].includes(x?.type) ? x.type : 'alternate', status: ['hinted','unlocked'].includes(x?.status) ? x.status : 'locked', hint: str(x?.hint), description: str(x?.description) }));
+        const cal = raw.calendar && typeof raw.calendar === 'object' ? raw.calendar : {};
+        st.calendar = { date: str(cal.date) || old?.calendar?.date || '', season: str(cal.season) || old?.calendar?.season || '', events: mergeById(cal.events, old?.calendar?.events, 30, x => ({ id: str(x?.id), title: str(x?.title), date: str(x?.date), description: str(x?.description) })) };
 
         return { st, events };
     }
@@ -426,7 +471,9 @@ ${SCHEMA}`;
             </div>`;
         }).join('');
         const choices = st.choices.map((x, i) => `<button class="otm-choice" data-act="choice" data-i="${i}">${esc(x)}</button>`).join('');
+        const avatar = characterAvatar();
         return `
+            <div class="otm-character-banner">${avatar ? `<img src="${esc(avatar)}" alt="">` : '<span>✦</span>'}<div><b>${name}</b><small>${esc(st.stage || 'История продолжается')}</small></div></div>
             <div class="otm-mood">
                 <span class="otm-emoji">${esc(st.mood.emoji)}</span>
                 <div><div class="otm-mlabel">${esc(st.mood.label)}</div><div class="otm-stage">${esc(st.stage)}</div></div>
@@ -488,6 +535,36 @@ ${SCHEMA}`;
             ${dia.length ? `<div class="otm-sec">Дневник героя</div>${dia.map(e => `<div class="otm-dia">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('')}` : ''}`;
     }
 
+    function characterAvatar() {
+        const c = ctx(); const ch = c.characters?.[c.characterId];
+        const avatar = field(ch, 'avatar');
+        if (!avatar || avatar === 'none') return '';
+        try { return typeof getThumbnailUrl === 'function' ? getThumbnailUrl('avatar', avatar) : `/characters/${encodeURIComponent(avatar)}`; }
+        catch { return ''; }
+    }
+
+    function viewCG(st) {
+        if (!st) return emptyView();
+        const items = st.cg || [];
+        return items.length ? `<div class="otm-gallery">${items.map(x => `<article class="otm-cg"><div class="otm-cg-art">✦</div><b>${esc(x.title)}</b><blockquote>«${esc(x.quote || '…')}»</blockquote><p>${esc(x.description)}</p><small>Ход ${x.turn}</small></article>`).join('')}</div>` : '<div class="otm-none">Здесь появятся важные сцены вашей истории — Система сохранит их после подтверждения в переписке.</div>';
+    }
+    function viewAchievements(st) {
+        if (!st) return emptyView();
+        const items = st.achievements || []; const unlocked = items.filter(x => x.unlocked);
+        return `<div class="otm-sec">Открыто: ${unlocked.length}</div>${unlocked.length ? unlocked.map(x => `<div class="otm-ach ${esc(x.rarity)}"><span>🏅</span><div><b>${esc(x.title)}</b><small>${esc(x.description)}</small></div><i>${esc(x.rarity)}</i></div>`).join('') : '<div class="otm-none">Пока нет открытых достижений. Скрытые не показываются до обнаружения.</div>'}`;
+    }
+    function viewEndings(st) {
+        if (!st) return emptyView();
+        const items = st.endings || [];
+        const labels = { good: 'Хорошая', bad: 'Плохая', true: 'Истинная', hidden: 'Скрытая', alternate: 'Альтернативная' };
+        return items.length ? items.map(x => `<div class="otm-ending-card ${x.status === 'unlocked' ? 'opened' : ''}"><div><b>${x.status === 'locked' ? '???' : esc(x.title)}</b><span>${labels[x.type] || 'Маршрут'} · ${x.status === 'unlocked' ? 'Открыта' : x.status === 'hinted' ? 'Есть подсказка' : 'Закрыта'}</span></div><p>${x.status === 'unlocked' ? esc(x.description) : esc(x.hint || 'Пока нет подсказок.')}</p></div>`).join('') : '<div class="otm-none">Архив концовок пока пуст. Система будет добавлять маршруты только по мере развития сюжета.</div>';
+    }
+    function viewCalendar(st) {
+        if (!st) return emptyView();
+        const cal = st.calendar || {}; const events = cal.events || [];
+        return `<div class="otm-calendar-head"><span>📅</span><div><b>${esc(cal.date || 'Дата не установлена')}</b><small>${esc(cal.season || 'Сезон неизвестен')}</small></div></div>${events.length ? events.map(x => `<div class="otm-cal-event"><b>${esc(x.title)}</b><span>${esc(x.date || 'Дата не указана')}</span><p>${esc(x.description)}</p></div>`).join('') : '<div class="otm-none">События календаря появятся, когда даты и праздники будут установлены в истории.</div>'}`;
+    }
+
     function viewSettings() {
         const s = S();
         const cur = getState();
@@ -500,6 +577,7 @@ ${SCHEMA}`;
             ${chk('inject', 'Подмешивать состояние в промпт', 'Персонаж ведёт себя по настроению и чувствам (около 80 токенов)')}
             ${chk('notify', 'Всплывающие уведомления')}
             ${chk('floating', 'Плавающая кнопка на экране')}
+            <label class="otm-row otm-theme-row"><span>Цветовая тема<small>Меняет только оформление окна Системы</small></span><select data-set="theme" class="otm-theme-select">${[['violet','Аметист'],['rose','Розовая'],['blue','Сапфир'],['emerald','Изумруд'],['gold','Золото'],['crimson','Рубин']].map(([v,n]) => `<option value="${v}" ${s.theme===v?'selected':''}>${n}</option>`).join('')}</select></label>
             ${chk('fullPreset', 'Обновлять через полный пресет', 'Дороже по токенам, экспериментально. Нужно, если модель отказывается от обновлений без пресета')}
             <div class="otm-sec">Пожелания к Системе</div>
             <textarea class="otm-ta" data-set="extra" rows="3" placeholder="Например: больше интриг, жёстче штрафы, следить за ревностью">${esc(s.extra)}</textarea>
@@ -519,11 +597,12 @@ ${SCHEMA}`;
         const body = document.getElementById('otm-body');
         if (!body) return;
         const st = getState();
-        const views = { status: viewStatus, quests: viewQuests, log: viewLog, diary: viewDiary };
-        body.innerHTML = tab === 'settings' ? viewSettings() : views[tab](st);
+        const views = { status: viewStatus, quests: viewQuests, cg: viewCG, achievements: viewAchievements, endings: viewEndings, calendar: viewCalendar, log: viewLog, diary: viewDiary };
+        body.innerHTML = tab === 'settings' ? viewSettings() : (views[tab] || viewStatus)(st);
         document.querySelectorAll('#otm-modal .otm-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
         const sub = document.getElementById('otm-sub');
         if (sub) sub.textContent = st ? (ctx().name2 || '') : '';
+        applyTheme();
     }
 
     function openPanel() {
@@ -556,6 +635,7 @@ ${SCHEMA}`;
                 <div class="otm-body" id="otm-body"></div>
             </div>`;
         document.body.appendChild(m);
+        applyTheme();
 
         m.addEventListener('click', async e => {
             const tabBtn = e.target.closest('[data-tab]');
@@ -643,6 +723,7 @@ ${SCHEMA}`;
             else s[k] = el.value;
             saveS();
             applyFloating();
+            applyTheme();
             applyInjection();
         });
     }
