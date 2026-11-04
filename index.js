@@ -1,385 +1,729 @@
-const MODULE = 'fate_system';
-const PREFIX = '[FATE SYSTEM]';
-const DEFAULTS = {
-    enabled: true,
-    autoAnalysis: true,
-    frozen: false,
-    interval: 8,
-    showNotifications: true,
-};
-const DEFAULT_STATE = {
-    version: 3,
-    canon: { source: 'character_card', summary: 'Read directly from the active card; never modified by FATE SYSTEM.' },
-    character: { name: 'Unknown character', role: '', mood: 'Unknown', outwardBehavior: 'Unknown', currentGoal: 'Unknown' },
-    relationship: { status: 'Not enough evidence', affection: null, attraction: null, trust: null, respect: null, curiosity: null, resentment: null, frustration: null, attachment: null, evidence: 'No analysis yet.', confidence: 'none' },
-    thoughts: 'Not analyzed yet.',
-    perception: 'Not analyzed yet.',
-    hiddenFeelings: 'Unknown',
-    currentEvents: [],
-    quests: [],
-    memories: [],
-    reputation: {},
-    world: { date: 'Unknown', time: 'Unknown', location: 'Unknown' },
-    lastAnalysis: null,
-    analyzedMessageCount: 0,
-};
+// Otome System — окно «Системы» в стиле отомэ-манхв для SillyTavern
+// Настроение, чувства, мысли, задания, штрафы, правила, подсказки, дневник.
+// Данные хранятся в самом чате (у каждой истории своя Система).
 
-let ctx;
-let settings;
-let state = structuredClone(DEFAULT_STATE);
-let chatKey = 'no-chat';
-let messageCounter = 0;
-let busy = false;
-let panel;
+(() => {
+    'use strict';
 
-function getChatKey() {
-    const c = SillyTavern.getContext();
-    const character = c.characters?.[c.characterId];
-    const title = c.chat?.[0]?.chat_metadata?.note
-        || c.chat?.[0]?.name
-        || c.chat?.[0]?.chat_id
-        || character?.name
-        || `character-${c.characterId ?? 'unknown'}`;
-    const stableId = c.chatId || c.chatMetadata?.chat_id || c.chat?.[0]?.chat_id || title;
-    return `${character?.avatar || character?.name || 'unknown'}::${String(stableId).slice(0, 160)}`;
-}
-
-async function storageGet(key) {
-    try {
-        const lf = SillyTavern.libs?.localforage;
-        if (lf) return await lf.getItem(key);
-    } catch (e) { console.warn(PREFIX, 'localforage read failed', e); }
-    try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
-}
-async function storageSet(key, value) {
-    try {
-        const lf = SillyTavern.libs?.localforage;
-        if (lf) return await lf.setItem(key, value);
-    } catch (e) { console.warn(PREFIX, 'localforage write failed', e); }
-    localStorage.setItem(key, JSON.stringify(value));
-}
-
-function getCharacterCard() {
-    const c = SillyTavern.getContext();
-    const ch = c.characters?.[c.characterId] || {};
-    return {
-        name: ch.name || 'Unknown',
-        description: ch.description || '',
-        personality: ch.personality || '',
-        scenario: ch.scenario || '',
-        first_mes: ch.first_mes || '',
-        mes_example: ch.mes_example || '',
-        creator_notes: ch.creator_notes || '',
+    const EXT = 'ST-OtomeSystem';
+    const META = 'otome_system';
+    const DEFAULTS = {
+        enabled: true,     // расширение включено
+        auto: true,        // автообновление
+        every: 4,          // раз в сколько ответов персонажа обновлять
+        inject: true,      // подмешивать состояние в промпт
+        notify: true,      // всплывающие уведомления
+        floating: true,    // плавающая кнопка
+        fullPreset: false, // обновлять через полный пресет (дороже, экспериментально)
+        frozen: false,     // заморозить чувства: задания, события и память продолжают обновляться
+        extra: '',         // свои пожелания к Системе
+        pos: null,
     };
-}
-function getCanonText() {
-    const card = getCharacterCard();
-    return [
-        card.description && `DESCRIPTION\n${card.description}`,
-        card.personality && `PERSONALITY\n${card.personality}`,
-        card.scenario && `SCENARIO\n${card.scenario}`,
-        card.first_mes && `FIRST MESSAGE\n${card.first_mes}`,
-        card.mes_example && `EXAMPLE DIALOGUE\n${card.mes_example}`,
-    ].filter(Boolean).join('\n\n').slice(0, 2600) || 'No readable card fields found.';
-}
 
-function getRecentChat() {
-    const chat = SillyTavern.getContext().chat || [];
-    return chat.slice(-24).map(m => ({
-        speaker: m.is_user ? 'USER' : (m.name || 'CHARACTER'),
-        text: String(m.mes || '').slice(0, 4000),
-    }));
-}
-function safeParse(text) {
-    if (!text) throw new Error('The model returned an empty response.');
-    const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
-    if (start < 0 || end <= start) throw new Error('No JSON object found in the analysis response.');
-    return JSON.parse(cleaned.slice(start, end + 1));
-}
-function clampStat(v) {
-    if (v === null || v === undefined || v === '' || Number.isNaN(Number(v))) return null;
-    return Math.max(0, Math.min(100, Math.round(Number(v))));
-}
-function mergeAnalysis(data) {
-    const str = (v, fallback = 'Unknown') => typeof v === 'string' && v.trim() ? v.trim() : fallback;
-    const arr = v => Array.isArray(v) ? v : [];
-    const rel = data.relationship || {};
-    state.canon = { ...(state.canon || {}), ...(data.canon || {}), source: 'character_card' };
-    state.character = {
-        name: str(data.character?.name, getCharacterCard().name),
-        role: str(data.character?.role, state.character.role || ''),
-        mood: str(data.character?.mood),
-        outwardBehavior: str(data.character?.outward_behavior),
-        currentGoal: str(data.character?.current_goal),
-    };
-    state.relationship = {
-        status: str(rel.status, state.relationship.status),
-        affection: clampStat(rel.affection) ?? state.relationship.affection,
-        attraction: clampStat(rel.attraction) ?? state.relationship.attraction,
-        trust: clampStat(rel.trust) ?? state.relationship.trust,
-        respect: clampStat(rel.respect) ?? state.relationship.respect,
-        curiosity: clampStat(rel.curiosity) ?? state.relationship.curiosity,
-        resentment: clampStat(rel.resentment) ?? state.relationship.resentment,
-        frustration: clampStat(rel.frustration) ?? state.relationship.frustration,
-        attachment: clampStat(rel.attachment) ?? state.relationship.attachment,
-        evidence: str(rel.evidence, state.relationship.evidence || 'Insufficient evidence.'),
-        confidence: ['low','medium','high'].includes(rel.confidence) ? rel.confidence : (state.relationship.confidence || 'none'),
-    };
-    state.thoughts = str(data.internal_monologue, 'Insufficient evidence.');
-    state.perception = str(data.perception_of_user, 'Insufficient evidence.');
-    state.hiddenFeelings = str(data.possible_hidden_feelings, 'Unknown');
-    state.canonVsObservation = str(data.canon_vs_observation, state.canonVsObservation || 'No comparison recorded.');
-    if (Array.isArray(data.current_events)) state.currentEvents = data.current_events.slice(0, 8);
-    if (Array.isArray(data.quests)) state.quests = data.quests.slice(0, 12);
-    if (Array.isArray(data.memories)) state.memories = [...new Set([...(state.memories || []), ...data.memories])].slice(-60);
-    state.reputation = data.reputation && typeof data.reputation === 'object' ? data.reputation : state.reputation;
-    state.world = {
-        date: str(data.world?.date, state.world.date),
-        time: str(data.world?.time, state.world.time),
-        location: str(data.world?.location, state.world.location),
-    };
-    state.lastAnalysis = new Date().toISOString();
-    state.analyzedMessageCount = getRecentChat().length;
-}
+    // ─── helpers ───────────────────────────────────────────────────────────
 
-function buildAnalysisPrompt() {
-    const card = getCharacterCard();
-    const history = getRecentChat();
-    return `You are FATE SYSTEM, a PASSIVE OBSERVER and continuity analyst. You are NOT a roleplay director, co-author, character controller, or behavior regulator.
+    const ctx = () => SillyTavern.getContext();
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+    const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
+    const str = v => (typeof v === 'string' ? v.trim() : (v == null ? '' : String(v).trim()));
 
-CRITICAL NON-INTERFERENCE RULES:
-- The character card is the source of truth for the character's personality, backstory, scenario, motivations, established relationships, and canon feelings.
-- Never rewrite, weaken, reinterpret away, contradict, or replace the character card. Never propose instructions that should be injected into the roleplay prompt.
-- Your output is an external analytical dossier only. It must not be used as a command to the character or as a condition for future replies.
-- Numeric relationship values are observations about recent displayed behavior, NOT the character's actual/total love, and NOT instructions. A low score must never mean that canon love disappears.
-- If the card says the character is deeply/in hopelessly in love, preserve that as canon even if recent behavior looks cold, conflicted, distant, angry, guarded, or inconsistent. Describe the discrepancy; do not change canon.
-- Separate: (A) CARD CANON, (B) OBSERVED BEHAVIOR, (C) POSSIBLE INTERPRETATION. Never blend them.
-- Do not infer that feelings have changed merely because of one scene. Distinguish temporary mood, deliberate concealment, conflict, and durable change; only say durable change if the story explicitly supports it.
-- Never invent inner thoughts as facts. Mark inference and confidence. Use Unknown / Insufficient evidence where needed.
-- Do not alter the user's character, steer the plot, create mandatory quests, or impose consequences. Quests/events are optional records of developments already present or strongly implied in the chat.
+    function S() {
+        const all = ctx().extensionSettings;
+        if (!all[EXT]) all[EXT] = {};
+        const s = all[EXT];
+        for (const k in DEFAULTS) if (s[k] === undefined) s[k] = DEFAULTS[k];
+        return s;
+    }
+    const saveS = () => ctx().saveSettingsDebounced();
 
-Analyze only the supplied card, chat, and previous dossier. Return ONLY valid JSON:
-{
- "canon":{"established_feelings":"string; quote/paraphrase only what card explicitly establishes, otherwise Unknown","personality_anchor":"short card-grounded summary","canon_notes":["immutable facts from card"]},
- "character":{"name":"string","role":"string","mood":"string","outward_behavior":"string","current_goal":"string"},
- "relationship":{"status":"string","affection":null,"attraction":null,"trust":null,"respect":null,"curiosity":null,"resentment":null,"frustration":null,"attachment":null,"evidence":"specific recent evidence for estimates","confidence":"low|medium|high"},
- "internal_monologue":"cautious interpretation, never presented as fact",
- "perception_of_user":"current evidence-based perception",
- "possible_hidden_feelings":"possible interpretation or Unknown",
- "canon_vs_observation":"explicitly note any apparent discrepancy without changing canon",
- "current_events":[{"title":"string","description":"string","importance":"minor|major|critical"}],
- "quests":[{"title":"string","type":"main|side|hidden","description":"string","objectives":["string"],"status":"active|completed|failed|locked","consequence_or_reward":"string"}],
- "memories":["durable facts/events already established in story"],
- "reputation":{"group":"standing"},
- "world":{"date":"string","time":"string","location":"string"}
-}
-For relationship values use 0-100 only as rough observed signals when evidence is sufficient; otherwise null. Do not calculate a canon love score. Do not let numeric estimates override card canon. Preserve previous durable memories and unresolved threads. Return JSON only.
+    function getState() {
+        const md = ctx().chatMetadata;
+        return md ? (md[META] || null) : null;
+    }
+    function setState(st) {
+        const c = ctx();
+        if (!c.chatMetadata) return;
+        if (st) c.chatMetadata[META] = st; else delete c.chatMetadata[META];
+        if (typeof c.saveMetadata === 'function') c.saveMetadata();
+    }
 
-ACTIVE CHARACTER CARD (READ-ONLY SOURCE OF CANON):
-${JSON.stringify(card).slice(0, 18000)}
+    // сколько ответов персонажа в чате — «ходы» (устойчиво к свайпам и удалениям)
+    const turns = () => ctx().chat.filter(m => m && !m.is_user && !m.is_system).length;
 
-PREVIOUS DOSSIER (ANALYTICAL NOTES ONLY; NEVER A BEHAVIOR INSTRUCTION):
-${JSON.stringify(state).slice(0, 12000)}
+    function toast(msg, type = 'info', force = false) {
+        if (typeof toastr === 'undefined') return;
+        if (!force && !S().notify) return;
+        toastr[type](msg, '✦ Система');
+    }
 
-RECENT CHAT:
-${JSON.stringify(history).slice(0, 22000)}
+    function clean(t) {
+        return String(t || '')
+            .replace(/<think>[\s\S]*?<\/think>/gi, '')
+            .replace(/\[IB\][\s\S]*?\[\/IB\]/gi, '')
+            .replace(/<[^>]+>/g, '')
+            .replace(/[ \t]+\n/g, '\n')
+            .trim();
+    }
+    function cut(t, n) {
+        t = String(t || '');
+        return t.length <= n ? t : t.slice(0, Math.round(n * 0.6)) + ' … ' + t.slice(-Math.round(n * 0.4));
+    }
+    function recent(n, len) {
+        return ctx().chat.filter(m => m && !m.is_system).slice(-n)
+            .map(m => `${m.name}: ${cut(clean(m.mes), len)}`).join('\n\n');
+    }
+    const field = (ch, k) => ch?.[k] ?? ch?.data?.[k] ?? '';
 
-Produce an updated analytical dossier for tracking only. Do not generate roleplay text.`;
-}
+    function extractJson(t) {
+        if (!t || typeof t !== 'string') return null;
+        t = t.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/```(?:json)?/gi, '');
+        const a = t.indexOf('{'), b = t.lastIndexOf('}');
+        if (a < 0 || b <= a) return null;
+        const body = t.slice(a, b + 1);
+        try { return JSON.parse(body); } catch (e) { /* пробуем починить */ }
+        try { return JSON.parse(body.replace(/,\s*([}\]])/g, '$1')); } catch (e) { /* не вышло */ }
+        return null;
+    }
 
-async function analyzeNow() {
-    if (busy) return;
-    if (!settings.enabled) return;
-    if (settings.frozen) { notify('State is frozen. Unfreeze it before updating.', 'warning'); return; }
-    const c = SillyTavern.getContext();
-    if (!c.chat?.length) { notify('Open a chat first.', 'warning'); return; }
-    busy = true;
-    const previousSnapshot = structuredClone(state);
-    render();
-    try {
-        const { generateQuietPrompt } = SillyTavern.getContext();
-        if (typeof generateQuietPrompt !== 'function') throw new Error('generateQuietPrompt is unavailable in this SillyTavern build.');
-        const result = await generateQuietPrompt({ quietPrompt: buildAnalysisPrompt() });
-        const parsed = safeParse(result);
-        mergeAnalysis(parsed);
-        state.previousSnapshot = previousSnapshot;
-        await saveState();
-        notify('Chronicle synchronized.', 'success');
-    } catch (e) {
-        console.error(PREFIX, e);
-        notify(`Analysis failed: ${e.message}`, 'error');
-    } finally {
-        busy = false;
+    // ─── prompts ───────────────────────────────────────────────────────────
+
+    const SCHEMA = `{
+  "profile": "<only when creating: 5-7 sentences in Russian — who the character is, the setting, the relationship premise, his/her wounds and secrets. When updating: copy the existing profile>",
+  "stage": "<short label of the current relationship stage, e.g. 'Холодное перемирие'>",
+  "mood": {"emoji": "<one emoji>", "label": "<2-3 words>"},
+  "thought": "<what the character thinks RIGHT NOW, first person, 1-2 short sentences>",
+  "shows": "<how the character outwardly behaves, up to 12 words>",
+  "hides": "<what the character really feels but hides, up to 12 words>",
+  "stats": [{"name": "<Russian name>", "icon": "<emoji>", "value": 0}],
+  "quests": [{"id": "q1", "type": "main|plot|relation|side", "title": "", "desc": "<1 sentence>", "reward": "<short>", "penalty": "<short>", "status": "active|done|failed|locked", "deadline": null}],
+  "rules": ["<short rule of this story's system>"],
+  "choices": ["<short action for the player>"],
+  "ending": "<one line: where this route is heading>",
+  "events": [{"type": "quest|reward|penalty|event|moment", "level": "<only for penalty: minor|major|critical>", "text": "<one short line>"}],
+  "memories": ["<only NEW durable facts: promises, conflicts, insults, gifts, secrets, confessions; max 3, one short line each>"],
+  "hook": {"title": "<short>", "text": "<1-2 sentences: an event that could happen next and moves the story>"},
+  "diary": "<optional: one private diary line of the character, or empty string>"
+}`;
+
+    function compact(st) {
+        if (!st) return null;
+        const t = turns();
+        return {
+            stage: st.stage, mood: st.mood, thought: st.thought,
+            stats: st.stats.map(x => ({ name: x.name, icon: x.icon, value: x.value })),
+            quests: st.quests.map(q => ({
+                id: q.id, type: q.type, title: q.title, desc: q.desc, reward: q.reward, penalty: q.penalty,
+                status: q.status, deadline: q.dueTurn ? Math.max(0, q.dueTurn - t) : null,
+            })),
+            rules: st.rules,
+            memories: (st.memories || []).slice(0, 8).map(m => m.text),
+        };
+    }
+
+    function buildPrompts(old, full, note) {
+        const c = ctx();
+        const s = S();
+        const ch = c.characters?.[c.characterId];
+        const cn = c.name2 || field(ch, 'name') || 'Character';
+        const un = c.name1 || 'User';
+
+        const system = `You are the hidden "System" of an otome-game-style roleplay (like the status windows in otome / isekai manhwa). You read the story and keep a status window for the character ${cn} and the player's persona ${un}. Reply with ONE valid JSON object only: no markdown, no comments, no text outside the JSON. All text values must be in Russian.`;
+
+        let p = '';
+        if (!full) {
+            if (old) {
+                p += `CHARACTER PROFILE (${cn}): ${old.profile || ''}\n\n`;
+            } else {
+                p += `CHARACTER CARD (${cn}):\n${cut(field(ch, 'description'), 7000)}\n`;
+                const pers = field(ch, 'personality'), scen = field(ch, 'scenario');
+                if (pers) p += `Personality: ${cut(pers, 800)}\n`;
+                if (scen) p += `Scenario: ${cut(scen, 1200)}\n`;
+                p += '\n';
+            }
+        } else if (old) {
+            p += `CHARACTER PROFILE (${cn}): ${old.profile || ''}\n\n`;
+        }
+        p += `PLAYER PERSONA: ${un}\n`;
+        if (s.extra.trim()) p += `PLAYER'S EXTRA WISHES FOR THE SYSTEM: ${s.extra.trim()}\n`;
+        p += `\nCURRENT STATE (turn ${turns()}):\n${old ? JSON.stringify(compact(old)) : 'none — create the system from scratch'}\n`;
+        if (note) p += `\nNOTE: ${note}\n`;
+        p += full ? '\nThe recent chat is the conversation above.\n'
+                  : `\nRECENT CHAT:\n${recent(old ? 8 : 6, 1100)}\n`;
+
+        p += `
+TASK: ${old ? 'Update' : 'Create'} the status window from the story.
+RULES:
+- stats: 3-4 meters that fit THIS story and relationship (for example affection, trust, plus 1-2 story-specific ones). Values 0-100. They change gradually (usually 0-8 per update), more only after major events. Keep the same stat names between updates.
+- quests: keep ids stable. 3-5 active at once: at least one "main" (story goal), the rest a mix of "plot" (intrigue, family, work, danger, mystery), "relation" (romance, trust) and "side". NOT only romance. Each has a short reward and a short penalty (the consequence of failing, e.g. a drop in a stat). deadline = number of turns left, or null.
+- mark a quest "done" only if the chat clearly fulfilled it, "failed" if it clearly failed. Replace finished quests with new ones that grow out of the story.
+- when a quest is done: raise the related stat and add an event of type "reward". When a quest failed or a rule was broken by the player: lower the related stat and add an event of type "penalty".
+- rules: 2-4 short rules of this story's "system", derived from the setting and the relationship (what the player must or must not do).
+- events: only NEW things since the last update, max 4, one short line each.
+- thought, shows, hides, mood must reflect the LAST messages. thought is in first person, in the character's voice, without quotation marks. mood.emoji is exactly one emoji.
+- choices: 3 short actions the player could take next, first person, no quotation marks.
+- judge feelings by ACTIONS, not words: if the character says one thing and does another, do not raise the stat, show the contradiction in "shows" and "hides". A good scene is not an automatic romantic breakthrough, stats may also fall.
+- the character has his/her own life: at least one active "plot" quest should be the character's OWN agenda (duty, family, work, politics), independent of the player.
+- if the setting has social groups (court, family, army, society), one stat may be the player's reputation among them.
+- "locked" quests are hidden teasers: put the unlock condition in desc, switch to "active" only when the story triggers it.
+- penalties must follow from what really happened and carry a level in the event: "minor" (mood, small loss), "major" (plot consequence), "critical" (irreversible turn). Never punish merely for ignoring a quest without consequences in the story.
+- memories: durable facts worth remembering 100 messages later; never repeat ones already listed.
+- hook: one event that could plausibly happen next (a letter, a visit, news, a conflict). It must move the story, not only the romance.
+- Do not invent facts that contradict the chat. No meta commentary.
+
+JSON SHAPE:
+${SCHEMA}`;
+        return { system, prompt: p };
+    }
+
+    function variants(fn, objArgs, posArgs) {
+        // в новых версиях ST функции принимают объект (fn.length === 0), в старых — позиционные аргументы
+        const o = () => fn(objArgs);
+        const p = () => fn(...posArgs);
+        return fn.length === 0 ? [o, p] : [p, o];
+    }
+
+    async function callLLM(system, prompt, full) {
+        const c = ctx();
+        const LEN = 2500;
+        const list = [];
+        if (full && typeof c.generateQuietPrompt === 'function') {
+            const q = system + '\n\n' + prompt;
+            list.push(...variants(c.generateQuietPrompt,
+                { quietPrompt: q, skipWIAN: true, responseLength: LEN },
+                [q, false, true, null, null, LEN]));
+        } else if (typeof c.generateRaw === 'function') {
+            list.push(...variants(c.generateRaw,
+                { prompt, systemPrompt: system, responseLength: LEN },
+                [prompt, null, false, false, system, LEN]));
+        }
+        for (const f of list) {
+            try {
+                const r = await f();
+                const j = extractJson(typeof r === 'string' ? r : (r?.text || r?.content || ''));
+                if (j) return j;
+            } catch (e) {
+                console.warn(`[${EXT}] generation attempt failed`, e);
+            }
+        }
+        return null;
+    }
+
+    // ─── state ─────────────────────────────────────────────────────────────
+
+    const EV_TYPES = ['quest', 'reward', 'penalty', 'event', 'moment'];
+    const Q_TYPES = ['main', 'plot', 'relation', 'side'];
+
+    function normalize(raw, old) {
+        const t = turns();
+        const arr = v => (Array.isArray(v) ? v : []);
+
+        const st = {
+            v: 1,
+            profile: str(raw.profile) || old?.profile || '',
+            stage: str(raw.stage),
+            mood: { emoji: str(raw.mood?.emoji) || '😐', label: str(raw.mood?.label) },
+            thought: str(raw.thought),
+            shows: str(raw.shows),
+            hides: str(raw.hides),
+            ending: str(raw.ending),
+            rules: arr(raw.rules).map(str).filter(Boolean).slice(0, 5),
+            choices: arr(raw.choices).map(str).filter(Boolean).slice(0, 4),
+            stats: [],
+            quests: [],
+            log: old?.log ? [...old.log] : [],
+            diary: old?.diary ? [...old.diary] : [],
+            memories: old?.memories ? [...old.memories] : [],
+            hook: null,
+            lastTurn: t,
+            updatedAt: Date.now(),
+        };
+
+        st.stats = arr(raw.stats).slice(0, 5).map(x => {
+            const name = str(x?.name);
+            const value = clamp(Math.round(Number(x?.value)) || 0, 0, 100);
+            const prev = old?.stats?.find(o => o.name.toLowerCase() === name.toLowerCase());
+            return { name, icon: str(x?.icon) || '•', value, prev: prev ? prev.value : value };
+        }).filter(x => x.name);
+
+        // заморозка: чувства не трогаем, остальное обновляется
+        if (S().frozen && old) {
+            st.stats = old.stats.map(x => ({ ...x, prev: x.value }));
+            st.stage = old.stage; st.mood = old.mood; st.thought = old.thought;
+            st.shows = old.shows; st.hides = old.hides;
+        }
+
+        const fresh = arr(raw.quests).slice(0, 12).map((q, i) => {
+            const id = str(q?.id) || ('q' + (i + 1));
+            const o = old?.quests?.find(x => x.id === id);
+            const dl = Number(q?.deadline);
+            let due = o?.dueTurn ?? null;
+            if (!due && Number.isFinite(dl) && dl > 0) due = t + Math.round(dl);
+            const status = ['done', 'failed', 'locked'].includes(q?.status) ? q.status : 'active';
+            return {
+                id, type: Q_TYPES.includes(q?.type) ? q.type : 'side',
+                title: str(q?.title), desc: str(q?.desc), reward: str(q?.reward), penalty: str(q?.penalty),
+                status, dueTurn: status === 'active' ? due : null,
+            };
+        }).filter(q => q.title);
+
+        // старые завершённые, которых модель не вернула, сохраняем как историю
+        const ids = new Set(fresh.map(q => q.id));
+        const isFin = q => q.status === 'done' || q.status === 'failed';
+        const history = (old?.quests || []).filter(q => isFin(q) && !ids.has(q.id));
+        const active = fresh.filter(q => q.status === 'active').slice(0, 6);
+        const locked = fresh.filter(q => q.status === 'locked').slice(0, 3);
+        const finished = [...fresh.filter(isFin), ...history].slice(0, 12);
+        st.quests = [...active, ...locked, ...finished];
+
+        const events = arr(raw.events).slice(0, 4)
+            .map(e => ({ turn: t, type: EV_TYPES.includes(e?.type) ? e.type : 'event', level: ['minor', 'major', 'critical'].includes(e?.level) ? e.level : '', text: str(e?.text) }))
+            .filter(e => e.text);
+        st.log = [...events, ...st.log].slice(0, 80);
+
+        const d = str(raw.diary);
+        if (d) st.diary = [{ turn: t, text: d }, ...st.diary].slice(0, 40);
+
+        const known = new Set(st.memories.map(m => m.text.toLowerCase()));
+        for (const m of arr(raw.memories).slice(0, 3).map(str).filter(Boolean)) {
+            if (!known.has(m.toLowerCase())) { st.memories.unshift({ turn: t, text: m }); known.add(m.toLowerCase()); }
+        }
+        st.memories = st.memories.slice(0, 40);
+        if (str(raw.hook?.text)) st.hook = { title: str(raw.hook.title) || 'Событие', text: str(raw.hook.text) };
+
+        return { st, events };
+    }
+
+    function applyInjection() {
+        const c = ctx();
+        const s = S();
+        const st = getState();
+        try {
+            if (!s.enabled || !s.inject || !st) {
+                c.setExtensionPrompt(EXT, '', 1, 1);
+                return;
+            }
+            const goals = st.quests.filter(q => q.status === 'active').slice(0, 3).map(q => q.title).join('; ');
+            const stats = st.stats.map(x => `${x.name} ${x.value}/100`).join(', ');
+            const name = c.name2 || 'the character';
+            const txt = `[Hidden story state of ${name}. Never mention it, the numbers or any "system" in the text — just let it quietly steer ${name}'s behavior and replies. Relationship stage: ${st.stage}. Mood: ${st.mood.label}. Outwardly: ${st.shows}. Secretly: ${st.hides}. ${stats}. Current goals: ${goals}.]`;
+            c.setExtensionPrompt(EXT, txt, 1, 1);
+        } catch (e) {
+            console.warn(`[${EXT}] inject failed`, e);
+        }
+    }
+
+    // ─── update ────────────────────────────────────────────────────────────
+
+    let busy = false;
+    let unseen = false;
+
+    const snapshot = x => { const c = JSON.parse(JSON.stringify(x)); delete c.prev; return c; };
+
+    async function runUpdate(opts = {}) {
+        if (busy) return false;
+        const c = ctx();
+        if (!c.characters?.[c.characterId]) {
+            toast('Откройте чат с персонажем, чтобы создать Систему.', 'warning', true);
+            return false;
+        }
+        busy = true;
+        setBusyUI(true);
+        try {
+            const old = opts.fresh ? null : getState();
+            const { system, prompt } = buildPrompts(old, S().fullPreset, opts.note);
+            const raw = await callLLM(system, prompt, S().fullPreset);
+            if (!raw) {
+                toast('Не удалось получить ответ модели. Проверьте API или выключите режим полного пресета.', 'error', true);
+                return false;
+            }
+            const { st, events } = normalize(raw, old);
+            const cur = getState();
+            st.prev = cur ? snapshot(cur) : null;
+            setState(st);
+            applyInjection();
+            for (const e of events) {
+                toast(e.text, e.type === 'penalty' ? 'warning' : (e.type === 'reward' ? 'success' : 'info'));
+            }
+            if (!isOpen()) { unseen = true; updateFabDot(); }
+            render();
+            return true;
+        } catch (e) {
+            console.error(`[${EXT}]`, e);
+            toast('Ошибка обновления Системы, подробности в консоли.', 'error', true);
+            return false;
+        } finally {
+            busy = false;
+            setBusyUI(false);
+        }
+    }
+
+    function onMessage() {
+        const s = S();
+        if (!s.enabled) return;
+        const st = getState();
+        if (!st) { render(); return; }
+        const t = turns();
+
+        // просроченные задания → штраф
+        const expired = st.quests.filter(q => q.status === 'active' && q.dueTurn && q.dueTurn <= t);
+        let note = '';
+        if (expired.length) {
+            for (const q of expired) {
+                q.status = 'failed';
+                q.dueTurn = null;
+                st.log.unshift({ turn: t, type: 'penalty', text: `Время вышло: «${q.title}». Штраф: ${q.penalty || '—'}` });
+                toast(`Время вышло: «${q.title}». Штраф: ${q.penalty || '—'}`, 'warning');
+            }
+            note = `The timer just failed these quests: ${expired.map(q => `"${q.title}" (penalty: ${q.penalty})`).join('; ')}. Lower the related stats accordingly, but do NOT add events for them (already logged).`;
+            setState(st);
+            if (!isOpen()) { unseen = true; updateFabDot(); }
+        }
+
+        if (s.auto && (expired.length || t - (st.lastTurn || 0) >= s.every)) {
+            setTimeout(() => runUpdate({ note }), 700);
+        } else {
+            render();
+        }
+    }
+
+    // ─── UI ────────────────────────────────────────────────────────────────
+
+    let tab = 'status';
+    const isOpen = () => { const m = document.getElementById('otm-modal'); return !!m && !m.classList.contains('otm-hidden'); };
+
+    function setBusyUI(v) {
+        document.getElementById('otm-modal')?.classList.toggle('otm-busy', v);
+        document.getElementById('otm-fab')?.classList.toggle('busy', v);
+    }
+    function updateFabDot() { document.getElementById('otm-fab')?.classList.toggle('dot', unseen); }
+
+    function emptyView() {
+        return `<div class="otm-empty">
+            <div class="otm-big">✦</div>
+            <div class="otm-etitle">Система не создана</div>
+            <div class="otm-edesc">Она прочитает карточку персонажа и вашу историю, заполнит настроение, чувства, мысли и выдаст первые задания.</div>
+            <button class="otm-btn otm-primary" data-act="init">✨ Создать Систему</button>
+        </div>`;
+    }
+
+    function ago(ts) {
+        const m = Math.round((Date.now() - ts) / 60000);
+        if (m < 1) return 'только что';
+        if (m < 60) return `${m} мин назад`;
+        const h = Math.round(m / 60);
+        return h < 24 ? `${h} ч назад` : `${Math.round(h / 24)} дн назад`;
+    }
+
+    function viewStatus(st) {
+        if (!st) return emptyView();
+        const name = esc(ctx().name2 || 'Персонаж');
+        const stats = st.stats.map(x => {
+            const d = x.value - x.prev;
+            const dh = d ? `<em class="${d > 0 ? 'up' : 'down'}">${d > 0 ? '▲' : '▼'}${Math.abs(d)}</em>` : '';
+            return `<div class="otm-stat">
+                <div class="otm-srow"><span>${esc(x.icon)} ${esc(x.name)}</span><b>${x.value}${dh}</b></div>
+                <div class="otm-bar"><i style="width:${x.value}%"></i></div>
+            </div>`;
+        }).join('');
+        const choices = st.choices.map((x, i) => `<button class="otm-choice" data-act="choice" data-i="${i}">${esc(x)}</button>`).join('');
+        return `
+            <div class="otm-mood">
+                <span class="otm-emoji">${esc(st.mood.emoji)}</span>
+                <div><div class="otm-mlabel">${esc(st.mood.label)}</div><div class="otm-stage">${esc(st.stage)}</div></div>
+            </div>
+            <div class="otm-sec">Чувства</div>
+            ${stats}
+            <div class="otm-sec">Мысли</div>
+            <div class="otm-thought">«${esc(st.thought)}»<small>— ${name}, про себя</small></div>
+            <div class="otm-two">
+                <div class="otm-mini"><small>Показывает</small>${esc(st.shows)}</div>
+                <div class="otm-mini"><small>Скрывает</small>${esc(st.hides)}</div>
+            </div>
+            ${st.ending ? `<div class="otm-sec">Куда всё идёт</div><div class="otm-ending">${esc(st.ending)}</div>` : ''}
+            ${st.hook ? `<div class="otm-sec">Событие от Системы</div><div class="otm-hook"><b>${esc(st.hook.title)}</b><span>${esc(st.hook.text)}</span><button class="otm-btn" data-act="hook">➜ Ввести в сюжет</button></div>` : ''}
+            ${choices ? `<div class="otm-sec">Подсказки Системы</div><div class="otm-choices">${choices}</div>` : ''}
+            <div class="otm-foot"><span>Обновлено: ${ago(st.updatedAt)}</span><button class="otm-btn" data-act="update">🔄 Обновить</button></div>`;
+    }
+
+    const Q_LABEL = { main: 'ГЛАВНОЕ', plot: 'СЮЖЕТ', relation: 'ОТНОШЕНИЯ', side: 'ДОПОЛНИТЕЛЬНО' };
+
+    function viewQuests(st) {
+        if (!st) return emptyView();
+        const t = turns();
+        const active = st.quests.filter(q => q.status === 'active');
+        const done = st.quests.filter(q => q.status === 'done' || q.status === 'failed');
+        const locked = st.quests.filter(q => q.status === 'locked');
+        const card = q => {
+            const left = q.dueTurn ? Math.max(0, q.dueTurn - t) : null;
+            return `<div class="otm-q otm-${esc(q.type)}">
+                <div class="otm-qh"><span class="otm-chip">${Q_LABEL[q.type]}</span>${left !== null ? `<span class="otm-due">⏳ ${left} ход.</span>` : ''}</div>
+                <div class="otm-qt">${esc(q.title)}</div>
+                <div class="otm-qd">${esc(q.desc)}</div>
+                <div class="otm-qr"><span class="gain">🎁 ${esc(q.reward || '—')}</span><span class="loss">⚠ ${esc(q.penalty || '—')}</span></div>
+            </div>`;
+        };
+        return `
+            <div class="otm-sec">Активные задания</div>
+            ${active.map(card).join('') || '<div class="otm-none">Нет активных заданий</div>'}
+            ${locked.length ? `<div class="otm-sec">Скрытые задания</div>${locked.map(q => `<div class="otm-q otm-locked"><div class="otm-qt">🔒 ???</div><div class="otm-qd">Условие: ${esc(q.desc)}</div></div>`).join('')}` : ''}
+            ${st.rules.length ? `<div class="otm-sec">Правила Системы</div><ul class="otm-rules">${st.rules.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
+            ${done.length ? `<div class="otm-sec">Завершённые</div>${done.map(q => `<div class="otm-fin ${q.status}">${q.status === 'done' ? '✔' : '✖'} ${esc(q.title)}</div>`).join('')}` : ''}`;
+    }
+
+    const LOG_ICON = { reward: '🎁', penalty: '⚠️', quest: '📜', event: '✦', moment: '💫' };
+    const LEVEL = { minor: 'МАЛЫЙ ШТРАФ', major: 'СЕРЬЁЗНЫЙ ШТРАФ', critical: 'КРИТИЧЕСКИЙ' };
+
+    function viewLog(st) {
+        if (!st) return emptyView();
+        if (!st.log.length) return '<div class="otm-none">Пока пусто. События появятся после обновлений.</div>';
+        return st.log.slice(0, 50).map(e => `<div class="otm-log ${e.type}"><span>${LOG_ICON[e.type] || '✦'}</span><div>${e.level ? `<b class="otm-lv ${e.level}">${LEVEL[e.level]}</b> ` : ''}${esc(e.text)}<small>ход ${e.turn}</small></div></div>`).join('');
+    }
+
+    function viewDiary(st) {
+        if (!st) return emptyView();
+        const mem = st.memories || [];
+        const dia = st.diary || [];
+        if (!mem.length && !dia.length) return '<div class="otm-none">Пока пусто. Сюда попадают обещания, конфликты, секреты и личные записи героя.</div>';
+        return `${mem.length ? `<div class="otm-sec">Память: обещания, конфликты, секреты</div>${mem.map(e => `<div class="otm-mem">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('')}` : ''}
+            ${dia.length ? `<div class="otm-sec">Дневник героя</div>${dia.map(e => `<div class="otm-dia">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('')}` : ''}`;
+    }
+
+    function viewSettings() {
+        const s = S();
+        const cur = getState();
+        const chk = (k, label, hint = '') => `<label class="otm-row"><input type="checkbox" data-set="${k}" ${s[k] ? 'checked' : ''}><span>${label}${hint ? `<small>${hint}</small>` : ''}</span></label>`;
+        return `
+            ${chk('enabled', 'Система включена')}
+            ${chk('auto', 'Автообновление', 'Отдельный запрос к модели раз в несколько ответов')}
+            <label class="otm-row"><span>Обновлять каждые <input type="number" min="1" max="20" data-set="every" value="${s.every}" class="otm-num"> ответов</span></label>
+            ${chk('frozen', 'Заморозить чувства', 'Настроение, показатели и мысли не меняются. Задания, события и память обновляются')}
+            ${chk('inject', 'Подмешивать состояние в промпт', 'Персонаж ведёт себя по настроению и чувствам (около 80 токенов)')}
+            ${chk('notify', 'Всплывающие уведомления')}
+            ${chk('floating', 'Плавающая кнопка на экране')}
+            ${chk('fullPreset', 'Обновлять через полный пресет', 'Дороже по токенам, экспериментально. Нужно, если модель отказывается от обновлений без пресета')}
+            <div class="otm-sec">Пожелания к Системе</div>
+            <textarea class="otm-ta" data-set="extra" rows="3" placeholder="Например: больше интриг, жёстче штрафы, следить за ревностью">${esc(s.extra)}</textarea>
+            <div class="otm-foot2">
+                <button class="otm-btn" data-act="rollback" ${cur?.prev ? '' : 'disabled'}>↩ Откатить</button>
+                <button class="otm-btn" data-act="export" ${cur ? '' : 'disabled'}>⬇ Экспорт</button>
+                <button class="otm-btn" data-act="import">⬆ Импорт</button>
+                <input type="file" id="otm-file" accept="application/json,.json" hidden>
+            </div>
+            <div class="otm-foot2">
+                <button class="otm-btn" data-act="recreate">♻ Пересоздать</button>
+                <button class="otm-btn otm-danger" data-act="wipe">🗑 Стереть данные чата</button>
+            </div>`;
+    }
+
+    function render() {
+        const body = document.getElementById('otm-body');
+        if (!body) return;
+        const st = getState();
+        const views = { status: viewStatus, quests: viewQuests, log: viewLog, diary: viewDiary };
+        body.innerHTML = tab === 'settings' ? viewSettings() : views[tab](st);
+        document.querySelectorAll('#otm-modal .otm-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+        const sub = document.getElementById('otm-sub');
+        if (sub) sub.textContent = st ? (ctx().name2 || '') : '';
+    }
+
+    function openPanel() {
+        document.getElementById('otm-modal')?.classList.remove('otm-hidden');
+        unseen = false;
+        updateFabDot();
         render();
     }
-}
-function notify(message, type = 'info') {
-    if (settings?.showNotifications && window.toastr?.[type]) window.toastr[type](message, 'FATE SYSTEM');
-    else console.log(PREFIX, message);
-}
-async function saveState() {
-    await storageSet(`fate_state::${chatKey}`, state);
-}
-async function loadState() {
-    chatKey = getChatKey();
-    const saved = await storageGet(`fate_state::${chatKey}`);
-    state = saved && typeof saved === 'object' ? { ...structuredClone(DEFAULT_STATE), ...saved } : structuredClone(DEFAULT_STATE);
-    messageCounter = 0;
-    render();
-}
-function escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-function statRow(label, value) {
-    const v = value === null || value === undefined ? '—' : `${value}/100`;
-    const width = value === null || value === undefined ? 0 : value;
-    return `<div class="fate-stat"><div><span>${label}</span><b>${v}</b></div><div class="fate-track"><i style="width:${width}%"></i></div></div>`;
-}
-function render() {
-    if (!panel) return;
-    const r = state.relationship || {};
-    const quests = (state.quests || []).map(q => `<article class="fate-quest"><div class="fate-quest-top"><b>${escapeHtml(q.title || 'Untitled quest')}</b><span>${escapeHtml(q.status || 'active')}</span></div><small>${escapeHtml(q.type || 'side')} QUEST</small><p>${escapeHtml(q.description || '')}</p>${Array.isArray(q.objectives) ? `<ul>${q.objectives.map(x=>`<li>${escapeHtml(x)}</li>`).join('')}</ul>`:''}${q.consequence_or_reward ? `<em>${escapeHtml(q.consequence_or_reward)}</em>`:''}</article>`).join('') || '<p class="fate-muted">No quests recorded yet. Run an analysis to discover story objectives.</p>';
-    const events = (state.currentEvents || []).map(e => `<article class="fate-event"><b>${escapeHtml(e.title || 'Event')}</b><p>${escapeHtml(e.description || '')}</p><small>${escapeHtml(e.importance || 'minor')}</small></article>`).join('') || '<p class="fate-muted">No active events.</p>';
-    const memories = (state.memories || []).slice(-8).map(m=>`<li>${escapeHtml(m)}</li>`).join('') || '<li>No durable memories recorded.</li>';
-    panel.innerHTML = `
-      <div class="fate-header"><div><div class="fate-kicker">PASSIVE OBSERVER · v0.3.0</div><h2>FATE SYSTEM</h2></div><button class="fate-close" title="Close">×</button></div>
-      <div class="fate-character"><div class="fate-seal">✦</div><div><b>${escapeHtml(state.character?.name || getCharacterCard().name)}</b><small>${escapeHtml(state.character?.role || 'Character dossier')}</small></div><span class="fate-pill">${settings.frozen ? 'FROZEN' : (busy ? 'SYNCING' : 'ACTIVE')}</span></div>
-      <nav class="fate-tabs"><button data-tab="overview" class="active">Overview</button><button data-tab="quests">Quests</button><button data-tab="chronicle">Chronicle</button><button data-tab="settings">Settings</button></nav>
-      <section class="fate-page" data-page="overview">
-        <div class="fate-grid"><div class="fate-card"><small>MOOD</small><b>${escapeHtml(state.character?.mood || 'Unknown')}</b></div><div class="fate-card"><small>RELATIONSHIP</small><b>${escapeHtml(r.status || 'Unestablished')}</b></div><div class="fate-card"><small>LOCATION</small><b>${escapeHtml(state.world?.location || 'Unknown')}</b></div><div class="fate-card"><small>CURRENT GOAL</small><b>${escapeHtml(state.character?.currentGoal || 'Unknown')}</b></div></div>
-        <h3>Card canon · read only</h3><div class="fate-note"><small>ESTABLISHED BY CHARACTER CARD</small><p class="fate-canon-text">${escapeHtml(getCanonText())}</p><p>${escapeHtml('Copied from the active card for reference. FATE SYSTEM never edits it.')}</p><small>FATE SYSTEM NEVER EDITS OR OVERRIDES THIS</small></div><h3>Observed relationship signals · not behavior rules</h3>${statRow('Affection',r.affection)}${statRow('Attraction',r.attraction)}${statRow('Trust',r.trust)}${statRow('Respect',r.respect)}${statRow('Curiosity',r.curiosity)}${statRow('Resentment',r.resentment)}${statRow('Frustration',r.frustration)}${statRow('Attachment',r.attachment)}
-        <div class="fate-note"><small>CANON VS OBSERVATION</small><p>${escapeHtml(state.canonVsObservation || 'No comparison recorded yet.')}</p><small>ESTIMATE CONFIDENCE: ${escapeHtml(r.confidence || 'none')}</small><p>${escapeHtml(r.evidence || 'No evidence recorded.')}</p></div><h3>Analytical notes · not character thoughts as facts</h3><div class="fate-note"><small>INTERNAL MONOLOGUE · INFERENCE</small><p>${escapeHtml(state.thoughts)}</p></div><div class="fate-note"><small>PERCEPTION OF {{user}}</small><p>${escapeHtml(state.perception)}</p></div><div class="fate-note"><small>POSSIBLE HIDDEN FEELINGS</small><p>${escapeHtml(state.hiddenFeelings)}</p></div>
-        <h3>Current events</h3>${events}
-      </section>
-      <section class="fate-page hidden" data-page="quests"><h3>Quest board</h3>${quests}</section>
-      <section class="fate-page hidden" data-page="chronicle"><h3>Recorded memories</h3><ul class="fate-memory">${memories}</ul><h3>Synchronization</h3><p class="fate-muted">${state.lastAnalysis ? new Date(state.lastAnalysis).toLocaleString() : 'Never analyzed'}</p><div class="fate-tools"><button id="fate-export">Export dossier</button><button id="fate-rollback" ${state.previousSnapshot ? '' : 'disabled'}>Rollback</button><button id="fate-import">Import dossier</button><input id="fate-import-file" type="file" accept="application/json,.json" hidden></div></section>
-      <section class="fate-page hidden" data-page="settings"><h3>System controls</h3>
-        <label><input type="checkbox" id="fate-auto" ${settings.autoAnalysis?'checked':''}> Automatic background analysis</label>
-        <label>Analyze every <input type="number" id="fate-interval" min="2" max="30" value="${settings.interval}"> character replies</label>
-        <label><input type="checkbox" id="fate-freeze" ${settings.frozen?'checked':''}> Freeze saved state</label>
-        <label><input type="checkbox" id="fate-notify" ${settings.showNotifications?'checked':''}> Notifications</label>
-        <p class="fate-muted">FATE SYSTEM only observes and records. It never adds behavior instructions or edits the character card. State is stored separately per chat.</p>
-      </section>
-      <footer class="fate-footer"><button id="fate-update" ${busy || settings.frozen ? 'disabled':''}>${busy?'Analyzing…':'Update now'}</button><button id="fate-freeze-btn">${settings.frozen?'Unfreeze':'Freeze state'}</button></footer>`;
-    panel.querySelector('.fate-close').onclick = () => panel.classList.remove('open');
-    panel.querySelectorAll('.fate-tabs button').forEach(b => b.onclick = () => {
-        panel.querySelectorAll('.fate-tabs button').forEach(x=>x.classList.toggle('active',x===b));
-        panel.querySelectorAll('.fate-page').forEach(x=>x.classList.toggle('hidden',x.dataset.page!==b.dataset.tab));
+    function closePanel() { document.getElementById('otm-modal')?.classList.add('otm-hidden'); }
+
+    function buildModal() {
+        if (document.getElementById('otm-modal')) return;
+        const m = document.createElement('div');
+        m.id = 'otm-modal';
+        m.className = 'otm-hidden';
+        m.innerHTML = `
+            <div class="otm-backdrop" data-act="close"></div>
+            <div class="otm-window">
+                <div class="otm-head">
+                    <div class="otm-title">✦ СИСТЕМА <span id="otm-sub"></span><span class="otm-spin">⏳</span></div>
+                    <button class="otm-x" data-act="close">✕</button>
+                </div>
+                <div class="otm-tabs">
+                    <button class="otm-tab" data-tab="status">Статус</button>
+                    <button class="otm-tab" data-tab="quests">Задания</button>
+                    <button class="otm-tab" data-tab="log">Журнал</button>
+                    <button class="otm-tab" data-tab="diary">Память</button>
+                    <button class="otm-tab" data-tab="settings">⚙</button>
+                </div>
+                <div class="otm-body" id="otm-body"></div>
+            </div>`;
+        document.body.appendChild(m);
+
+        m.addEventListener('click', async e => {
+            const tabBtn = e.target.closest('[data-tab]');
+            if (tabBtn) { tab = tabBtn.dataset.tab; render(); return; }
+            const el = e.target.closest('[data-act]');
+            if (!el) return;
+            const act = el.dataset.act;
+            if (act === 'close') closePanel();
+            else if (act === 'init' || act === 'update') await runUpdate();
+            else if (act === 'choice') {
+                const st = getState();
+                const text = st?.choices?.[Number(el.dataset.i)];
+                const ta = document.getElementById('send_textarea');
+                if (text && ta) {
+                    ta.value = text;
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    closePanel();
+                    ta.focus();
+                }
+            } else if (act === 'hook') {
+                const h = getState()?.hook;
+                const ta = document.getElementById('send_textarea');
+                if (h && ta) {
+                    ta.value = h.text;
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    closePanel();
+                    ta.focus();
+                }
+            } else if (act === 'rollback') {
+                const cur = getState();
+                if (cur?.prev) {
+                    const restored = JSON.parse(JSON.stringify(cur.prev));
+                    restored.prev = snapshot(cur);
+                    setState(restored);
+                    applyInjection();
+                    render();
+                    toast('Предыдущее состояние восстановлено', 'success', true);
+                }
+            } else if (act === 'export') {
+                const blob = new Blob([JSON.stringify({ format: 'OTOME_SYSTEM', v: 1, state: getState() }, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = `otome-system-${Date.now()}.json`; a.click();
+                URL.revokeObjectURL(url);
+            } else if (act === 'import') {
+                document.getElementById('otm-file')?.click();
+            } else if (act === 'recreate') {
+                if (confirm('Пересоздать Систему с нуля? Журнал и дневник этого чата будут стёрты.')) {
+                    await runUpdate({ fresh: true });
+                }
+            } else if (act === 'wipe') {
+                if (confirm('Удалить все данные Системы в этом чате?')) {
+                    setState(null);
+                    applyInjection();
+                    render();
+                }
+            }
+        });
+
+        m.addEventListener('change', async e => {
+            if (e.target.id === 'otm-file') {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                try {
+                    const data = JSON.parse(await f.text());
+                    const st = data.state || data;
+                    if (!st || !Array.isArray(st.stats) || !Array.isArray(st.quests)) throw new Error('это не файл Системы');
+                    st.prev = null;
+                    setState(st);
+                    applyInjection();
+                    render();
+                    toast('Состояние импортировано', 'success', true);
+                } catch (err) {
+                    toast('Не удалось импортировать: ' + err.message, 'error', true);
+                }
+                e.target.value = '';
+                return;
+            }
+            const el = e.target.closest('[data-set]');
+            if (!el) return;
+            const s = S();
+            const k = el.dataset.set;
+            if (el.type === 'checkbox') s[k] = el.checked;
+            else if (el.type === 'number') s[k] = clamp(Math.round(Number(el.value)) || DEFAULTS[k], 1, 20);
+            else s[k] = el.value;
+            saveS();
+            applyFloating();
+            applyInjection();
+        });
+    }
+
+    // ─── кнопки запуска ────────────────────────────────────────────────────
+
+    function injectMenuItem() {
+        if (document.getElementById('otm-menu-item')) return;
+        const menu = document.getElementById('extensionsMenu');
+        if (!menu) return;
+        const item = document.createElement('div');
+        item.id = 'otm-menu-item';
+        item.className = 'list-group-item flex-container flexGap5';
+        item.innerHTML = '<div class="fa-solid fa-wand-sparkles extensionsMenuExtensionButton"></div><span>Система</span>';
+        item.addEventListener('click', openPanel);
+        menu.appendChild(item);
+    }
+
+    function applyFloating() {
+        const s = S();
+        let fab = document.getElementById('otm-fab');
+        if (!s.floating || !s.enabled) { fab?.remove(); return; }
+        if (fab) return;
+
+        const SIZE = 46;
+        fab = document.createElement('div');
+        fab.id = 'otm-fab';
+        fab.className = 'otm-fab';
+        fab.title = 'Система';
+        fab.textContent = '✦';
+        document.body.appendChild(fab);
+
+        const place = (x, y) => {
+            fab.style.left = clamp(x, 0, window.innerWidth - SIZE) + 'px';
+            fab.style.top = clamp(y, 0, window.innerHeight - SIZE) + 'px';
+        };
+        const pos = s.pos || { x: window.innerWidth - SIZE - 12, y: window.innerHeight - 230 };
+        place(pos.x, pos.y);
+        window.addEventListener('resize', () => place(fab.offsetLeft, fab.offsetTop));
+        updateFabDot();
+
+        let drag = null;
+        fab.addEventListener('pointerdown', e => {
+            drag = { sx: e.clientX, sy: e.clientY, bx: fab.offsetLeft, by: fab.offsetTop, moved: false };
+            fab.setPointerCapture(e.pointerId);
+        });
+        fab.addEventListener('pointermove', e => {
+            if (!drag) return;
+            const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+            if (Math.abs(dx) + Math.abs(dy) > 6) drag.moved = true;
+            if (drag.moved) place(drag.bx + dx, drag.by + dy);
+        });
+        fab.addEventListener('pointerup', () => {
+            if (!drag) return;
+            if (drag.moved) { S().pos = { x: fab.offsetLeft, y: fab.offsetTop }; saveS(); }
+            else openPanel();
+            drag = null;
+        });
+        fab.addEventListener('pointercancel', () => { drag = null; });
+    }
+
+    // ─── init ──────────────────────────────────────────────────────────────
+
+    if (globalThis.__OTOME_TEST__) {
+        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, buildPrompts, compact, cut, clean });
+    }
+
+    jQuery(async () => {
+        const { eventSource, event_types } = ctx();
+        buildModal();
+        injectMenuItem();
+        applyFloating();
+        applyInjection();
+
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onMessage);
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            unseen = false;
+            updateFabDot();
+            applyInjection();
+            render();
+        });
+        console.log(`[${EXT}] loaded`);
     });
-    panel.querySelector('#fate-update').onclick = analyzeNow;
-    panel.querySelector('#fate-export').onclick = exportDossier;
-    panel.querySelector('#fate-import').onclick = () => panel.querySelector('#fate-import-file').click();
-    panel.querySelector('#fate-import-file').onchange = importDossier;
-    panel.querySelector('#fate-rollback').onclick = rollbackState;
-    panel.querySelector('#fate-freeze-btn').onclick = async () => { settings.frozen = !settings.frozen; await saveSettings(); render(); };
-    const auto = panel.querySelector('#fate-auto'); if (auto) auto.onchange = async e => { settings.autoAnalysis=e.target.checked; await saveSettings(); };
-    const interval = panel.querySelector('#fate-interval'); if (interval) interval.onchange = async e => { settings.interval=Math.max(2,Math.min(30,Number(e.target.value)||8)); await saveSettings(); };
-    const freeze = panel.querySelector('#fate-freeze'); if (freeze) freeze.onchange = async e => { settings.frozen=e.target.checked; await saveSettings(); render(); };
-    const notifyBox = panel.querySelector('#fate-notify'); if (notifyBox) notifyBox.onchange = async e => { settings.showNotifications=e.target.checked; await saveSettings(); };
-}
-async function saveSettings() {
-    const c = SillyTavern.getContext();
-    c.extensionSettings[MODULE] = settings;
-    c.saveSettingsDebounced();
-}
-async function exportDossier() {
-    const payload = { format: 'FATE_SYSTEM_DOSSIER', version: 3, exportedAt: new Date().toISOString(), chatKey, state };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = `FATE-dossier-${Date.now()}.json`; a.click();
-    URL.revokeObjectURL(url); notify('Dossier exported.', 'success');
-}
-async function importDossier(event) {
-    const file = event.target.files?.[0]; if (!file) return;
-    try {
-        const data = JSON.parse(await file.text());
-        const imported = data.state || data;
-        if (!imported || typeof imported !== 'object' || !imported.relationship) throw new Error('This file is not a FATE dossier.');
-        state = { ...structuredClone(DEFAULT_STATE), ...imported };
-        await saveState(); render(); notify('Dossier imported.', 'success');
-    } catch (e) { notify(`Import failed: ${e.message}`, 'error'); }
-    event.target.value = '';
-}
-async function rollbackState() {
-    if (!state.previousSnapshot) return;
-    const current = structuredClone(state); const previous = structuredClone(state.previousSnapshot);
-    previous.previousSnapshot = current; state = previous;
-    await saveState(); render(); notify('Previous state restored.', 'success');
-}
-function ensurePanel() {
-    if (document.getElementById('fate-system-panel')) return;
-    panel = document.createElement('aside');
-    panel.id = 'fate-system-panel';
-    panel.className = 'fate-panel';
-    document.body.appendChild(panel);
-    const launcher = document.createElement('button');
-    launcher.id = 'fate-system-launcher';
-    launcher.textContent = '✦ FATE';
-    launcher.title = 'Open FATE SYSTEM';
-    launcher.onclick = () => { panel.classList.toggle('open'); render(); };
-    document.body.appendChild(launcher);
-}
-async function handleIncoming() {
-    if (!settings.enabled || !settings.autoAnalysis || settings.frozen || busy) return;
-    messageCounter++;
-    if (messageCounter >= Math.max(2, Number(settings.interval) || 8)) {
-        messageCounter = 0;
-        await analyzeNow();
-    }
-}
-let initialized = false;
-
-async function init() {
-    if (initialized) return;
-    try {
-        if (!window.SillyTavern || typeof window.SillyTavern.getContext !== 'function') {
-            throw new Error('SillyTavern context API is not available yet.');
-        }
-        ctx = window.SillyTavern.getContext();
-        if (!ctx || !ctx.eventSource || !ctx.event_types) {
-            throw new Error('SillyTavern event system is not ready yet.');
-        }
-        settings = { ...DEFAULTS, ...(ctx.extensionSettings?.[MODULE] || {}) };
-        ctx.extensionSettings[MODULE] = settings;
-        ctx.saveSettingsDebounced?.();
-
-        // The launcher and panel are created only after the application is ready.
-        ensurePanel();
-        await loadState();
-
-        const { eventSource, event_types } = ctx;
-        if (event_types.MESSAGE_RECEIVED) eventSource.on(event_types.MESSAGE_RECEIVED, handleIncoming);
-        if (event_types.CHAT_CHANGED) eventSource.on(event_types.CHAT_CHANGED, loadState);
-        if (event_types.CHAT_CREATED) eventSource.on(event_types.CHAT_CREATED, loadState);
-        initialized = true;
-        console.info(PREFIX, 'Initialized successfully; launcher mounted:', !!document.getElementById('fate-system-launcher'));
-        notify('FATE SYSTEM is ready. Tap ✦ FATE in the lower-right corner.', 'success');
-    } catch (error) {
-        console.error(PREFIX, 'Initialization failed:', error);
-        if (window.toastr?.error) window.toastr.error(error.message, 'FATE SYSTEM');
-    }
-}
-
-// APP_READY is the documented lifecycle event for non-blocking asynchronous UI setup.
-// The fallback handles older builds that do not expose that event constant.
-function registerLifecycle() {
-    try {
-        const context = window.SillyTavern?.getContext?.();
-        const readyEvent = context?.event_types?.APP_READY;
-        if (readyEvent && context.eventSource?.on) {
-            context.eventSource.on(readyEvent, () => { void init(); });
-            return;
-        }
-    } catch (error) {
-        console.warn(PREFIX, 'Could not subscribe to APP_READY; using DOM-ready fallback.', error);
-    }
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => { void init(); }, { once: true });
-    } else {
-        void init();
-    }
-}
-
-registerLifecycle();
+})();
