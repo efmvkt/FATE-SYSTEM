@@ -324,8 +324,15 @@ ${SCHEMA}`;
                 const mapped = mapItem(item);
                 if (!mapped.id || !mapped.title) continue;
                 const idx = out.findIndex(x => x.id === mapped.id);
-                if (idx >= 0) out[idx] = { ...out[idx], ...mapped };
-                else out.unshift(mapped);
+                if (idx >= 0) {
+                    const previous = out[idx];
+                    const merged = { ...previous, ...mapped };
+                    // Открытые достижения и концовки — постоянная история, модель не может закрыть их повторно.
+                    if ('unlocked' in previous && previous.unlocked === true) merged.unlocked = true;
+                    if (previous.status === 'unlocked') merged.status = 'unlocked';
+                    if (previous.status === 'hinted' && mapped.status === 'locked') merged.status = 'hinted';
+                    out[idx] = merged;
+                } else out.unshift(mapped);
             }
             return out.slice(0, limit);
         };
@@ -625,13 +632,17 @@ ${SCHEMA}`;
                     <div class="otm-title">✦ СИСТЕМА <span id="otm-sub"></span><span class="otm-spin">⏳</span></div>
                     <button class="otm-x" data-act="close">✕</button>
                 </div>
-                <div class="otm-tabs">
+                <nav class="otm-tabs" aria-label="Разделы Системы">
                     <button class="otm-tab" data-tab="status">Статус</button>
                     <button class="otm-tab" data-tab="quests">Задания</button>
+                    <button class="otm-tab" data-tab="cg">CG-альбом</button>
+                    <button class="otm-tab" data-tab="achievements">Достижения</button>
+                    <button class="otm-tab" data-tab="endings">Концовки</button>
+                    <button class="otm-tab" data-tab="calendar">Календарь</button>
                     <button class="otm-tab" data-tab="log">Журнал</button>
                     <button class="otm-tab" data-tab="diary">Память</button>
-                    <button class="otm-tab" data-tab="settings">⚙</button>
-                </div>
+                    <button class="otm-tab" data-tab="settings" aria-label="Настройки">⚙</button>
+                </nav>
                 <div class="otm-body" id="otm-body"></div>
             </div>`;
         document.body.appendChild(m);
