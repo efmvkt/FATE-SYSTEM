@@ -282,7 +282,7 @@
   "shows": "<how the character outwardly behaves, up to 12 words>",
   "hides": "<what the character really feels but hides, up to 12 words>",
   "stats": [{"name": "<Russian name>", "icon": "<emoji>", "value": 0}],
-  "quests": [{"id": "q1", "type": "main|plot|relation|side", "title": "", "desc": "<1 sentence>", "reward": "<short>", "penalty": "<short>", "status": "active|done|failed|locked", "due_in_days": null, "hard": false}],
+  "quests": [{"id": "q1", "type": "main|plot|relation|side", "title": "<what the PLAYER does, imperative>", "desc": "<1 sentence addressed to the player>", "reward": "<short>", "penalty": "<short>", "status": "active|done|failed|locked", "due_in_days": null, "hard": false}],
   "rules": ["<short rule of this story's system>"],
   "choices": ["<short action for the player>"],
   "ending": "<one line: where this route is heading>",
@@ -312,7 +312,7 @@
         if (s.mEnd) r += `- endings: 3-5 possible story directions (tendencies, not scripts; do not spoil). Keep ids stable. progress 0-100 = how close the story is to each right now. A "true" ending stays revealed=false until the story has clearly opened it. Set "ending" to the one-line direction of the leading route.
 `;
         if (s.mCal) r += `- calendar.today: the current in-story date as DD.MM.YYYY. Take it from the chat or the infoblock; if the story gives none, invent a plausible one for the setting and keep it consistent with the previous value (it moves forward only as story time passes).
-- calendar.events: plan the next ~3 weeks of this world as a calendar of 4-8 upcoming events on concrete days (in_days counted from today, 0 = today). Mix social events (balls, receptions, teas, theatre), duties (service, family, work, trips), holidays and seasonal customs, meetings with other characters, and deadlines. Tie at least 2 events to active quests (put the quest id) so that quests have scheduled things to do. required=true means missing it has consequences; the main plot's social obligations are usually required, holidays are not. Keep ids stable and do not move events without a story reason.
+- calendar.events: plan the next ~3 weeks of this world as a calendar of 4-8 upcoming events on concrete days (in_days counted from today, 0 = today). Mix social events (balls, receptions, teas, theatre), duties (service, family, work, trips), holidays and seasonal customs, meetings with other characters, and deadlines. Events are things the player can attend or take part in, even when the character hosts them. Tie at least 2 events to active quests (put the quest id) so that quests have scheduled things to do. required=true means missing it has consequences; the main plot's social obligations are usually required, holidays are not. Keep ids stable and do not move events without a story reason.
 - an event whose day has passed must be resolved: "done" if the chat shows it happened or the player attended, "missed" if not. A missed required event fails its linked quest and causes a penalty (lower a stat, add a penalty event). Never pretend something happened just to resolve an event.
 `;
         return r;
@@ -374,7 +374,7 @@
         }
         p += `PLAYER PERSONA: ${un}\n`;
         const gi0 = groupInfo();
-        if (gi0) p += `GROUP CHAT with several characters (${gi0.members.map(m => m.name).join(', ')}). Track ONLY ${cn}; all other characters are NPCs for this status window.\n`;
+        if (gi0) p += `GROUP CHAT with several characters (${gi0.members.map(m => m.name).join(', ')}). Track ONLY ${cn} (mood, feelings, thoughts, stage); all other characters are NPCs for this window. Quests stay tasks for the player (${un}) and may involve any characters of the group.\n`;
         const ib0 = lastIB();
         if (ib0?.date) p += `IN-STORY DATE (from the chat's infoblock): ${ib0.date}\n`;
         if (s.extra.trim()) p += `PLAYER'S EXTRA WISHES FOR THE SYSTEM: ${s.extra.trim()}\n`;
@@ -387,6 +387,7 @@
 TASK: ${old ? 'Update' : 'Create'} the status window from the story.
 RULES:
 - stats: 3-4 meters that fit THIS story and relationship (for example affection, trust, plus 1-2 story-specific ones). Values 0-100. They change gradually (usually 0-8 per update), more only after major events. Keep the same stat names between updates.
+- quests are tasks for the PLAYER (${un}), written as what ${un} can do next in the story ("Выяснить…", "Убедить…", "Прийти на…"). NEVER write a quest that the character does for himself/herself or about the character's own goal (like "make ${un} admit something"): the character's agenda belongs in the story, not in the quest list. If an existing active quest is worded as the character's own task, rewrite it as a task for the player and keep its id.
 - quests: keep ids stable. 3-5 active at once: at least one "main" (story goal), the rest a mix of "plot" (intrigue, family, work, danger, mystery), "relation" (romance, trust) and "side". NOT only romance. Each has a short reward and a short penalty (the consequence of failing, e.g. a drop in a stat). due_in_days = number of in-story days from today until the day the quest must be finished (tie it to a calendar event when possible, 0 = today), or null for an open-ended quest. A quest ends at the end of that day. hard = true only for a notably difficult quest.
 - quests with status "skipped" were closed by the player with a shop token: leave them alone, no reward and no penalty.
 - mark a quest "done" only if the chat clearly fulfilled it, "failed" if it clearly failed. Replace finished quests with new ones that grow out of the story.
@@ -396,7 +397,7 @@ RULES:
 - thought, shows, hides, mood must reflect the LAST messages. thought is in first person, in the character's voice, without quotation marks. mood.emoji is exactly one emoji.
 - choices: 3 short actions the player could take next, first person, no quotation marks.
 - judge feelings by ACTIONS, not words: if the character says one thing and does another, do not raise the stat, show the contradiction in "shows" and "hides". A good scene is not an automatic romantic breakthrough, stats may also fall.
-- the character has his/her own life: at least one active "plot" quest should be the character's OWN agenda (duty, family, work, politics), independent of the player.
+- the character has his/her own life (duty, family, work, politics). Show it through events, the hook and the calendar; quests are about how ${un} gets involved in it or reacts to it (help, find out, stop, support), never about the character's goals as such.
 - if the setting has social groups (court, family, army, society), one stat may be the player's reputation among them.
 - "locked" quests are hidden teasers: put the unlock condition in desc, switch to "active" only when the story triggers it.
 - penalties must follow from what really happened and carry a level in the event: "minor" (mood, small loss), "major" (plot consequence), "critical" (irreversible turn). Never punish merely for ignoring a quest without consequences in the story.
@@ -630,7 +631,7 @@ ${buildSchema()}`;
                 .filter(e => e.status === 'upcoming' && e.day != null && e.day - now >= 0 && e.day - now <= 7)
                 .sort((a, b) => a.day - b.day).slice(0, 3) : [];
             const up = soon.length ? ` Calendar: ${soon.map(e => `${e.title} (${rel(e.day, now)}${e.required ? ', required' : ''})`).join('; ')}.` : '';
-            const txt = `[Hidden story state of ${name}. Never mention it, the numbers or any "system" in the text — just let it quietly steer ${name}'s behavior and replies. Relationship stage: ${st.stage}. Mood: ${st.mood.label}. Outwardly: ${st.shows}. Secretly: ${st.hides}. ${stats}. Current goals: ${goals}.${up}]`;
+            const txt = `[Hidden story state of ${name}. Never mention it, the numbers or any "system" in the text — just let it quietly steer ${name}'s behavior and replies. Relationship stage: ${st.stage}. Mood: ${st.mood.label}. Outwardly: ${st.shows}. Secretly: ${st.hides}. ${stats}. The player's current quests: ${goals}.${up}]`;
             c.setExtensionPrompt(EXT, txt, 1, 1);
         } catch (e) {
             console.warn(`[${EXT}] inject failed`, e);
@@ -1428,7 +1429,7 @@ JSON SHAPE:
             } else if (act === 'import') {
                 document.getElementById('otm-file')?.click();
             } else if (act === 'recreate') {
-                if (confirm('Пересоздать Систему с нуля? Журнал и дневник этого чата будут стёрты.')) {
+                if (confirm('Пересоздать Систему с нуля? Журнал, дневник, газета и очки судьбы этого чата будут стёрты.')) {
                     await runUpdate({ fresh: true });
                 }
             } else if (act === 'wipe') {
