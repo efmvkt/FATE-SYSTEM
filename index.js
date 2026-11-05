@@ -21,6 +21,7 @@
         mAch: true,        // достижения
         mEnd: true,        // архив концовок
         mCal: true,        // календарь и события
+        mFP: true,         // очки судьбы (FP) и магазин
         extra: '',         // свои пожелания к Системе
         pos: null,
     };
@@ -30,6 +31,10 @@
     const ctx = () => SillyTavern.getContext();
     const esc = s => String(s ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
+    // данные состояния могут прийти из импортированного файла или чужого чата, поэтому всё, что идёт в HTML, приводим к безопасному виду
+    const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    const pct = v => clamp(num(v), 0, 100);
+    const cls = v => String(v ?? '').replace(/[^\w-]/g, '');
     const str = v => (typeof v === 'string' ? v.trim() : (v == null ? '' : String(v).trim()));
 
     function S() {
@@ -41,14 +46,72 @@
     }
     const saveS = () => ctx().saveSettingsDebounced();
 
+    // ─── герой Системы: один персонаж или выбранный участник группового чата ───
+
+    const META_G = 'otome_group';   // { focus: avatar, states: { avatar: state } }
+
+    const isGroup = () => !!ctx().groupId;
+
+    function groupInfo() {
+        const c = ctx();
+        if (!c.groupId) return null;
+        const g = (c.groups || []).find(x => String(x.id) === String(c.groupId));
+        if (!g) return null;
+        const members = (g.members || []).map(av => (c.characters || []).find(ch => ch.avatar === av)).filter(Boolean);
+        return { group: g, members };
+    }
+    function groupStore(create) {
+        const md = ctx().chatMetadata;
+        if (!md) return null;
+        if (!md[META_G] && create) md[META_G] = { focus: '', states: {} };
+        return md[META_G] || null;
+    }
+    function focusKey() {
+        const gi = groupInfo();
+        if (!gi) return null;
+        const f = groupStore(false)?.focus;
+        return (f && gi.members.some(m => m.avatar === f)) ? f : null;
+    }
+    function focusChar() {
+        const c = ctx();
+        if (!isGroup()) return c.characters?.[c.characterId] || null;
+        const k = focusKey();
+        return k ? (groupInfo()?.members.find(m => m.avatar === k) || null) : null;
+    }
+    const focusName = () => focusChar()?.name || ctx().name2 || 'Персонаж';
+
+    function setFocus(av) {
+        const gs = groupStore(true);
+        if (!gs) return;
+        gs.focus = av;
+        const c = ctx();
+        if (typeof c.saveMetadata === 'function') c.saveMetadata();
+        applyInjection();
+        render();
+    }
+
     function getState() {
         const md = ctx().chatMetadata;
-        return md ? (md[META] || null) : null;
+        if (!md) return null;
+        if (isGroup()) {
+            const k = focusKey();
+            return k ? (md[META_G]?.states?.[k] || null) : null;
+        }
+        return md[META] || null;
     }
     function setState(st) {
         const c = ctx();
         if (!c.chatMetadata) return;
-        if (st) c.chatMetadata[META] = st; else delete c.chatMetadata[META];
+        if (isGroup()) {
+            const k = focusKey();
+            if (!k) return;
+            const gs = groupStore(true);
+            if (st) gs.states[k] = st; else delete gs.states[k];
+        } else if (st) {
+            c.chatMetadata[META] = st;
+        } else {
+            delete c.chatMetadata[META];
+        }
         if (typeof c.saveMetadata === 'function') c.saveMetadata();
     }
 
@@ -64,7 +127,7 @@
     // ─── милые всплывающие окна (как уведомления в манхве) ────────────────
 
     const POP = {
-        quest: ['📜', 'Задание'], reward: ['🎁', 'Награда'], penalty: ['⚠️', 'Штраф'], ach: ['🏆', 'Достижение'],
+        fp: ['💎', 'Очки судьбы'], quest: ['📜', 'Задание'], reward: ['🎁', 'Награда'], penalty: ['⚠️', 'Штраф'], ach: ['🏆', 'Достижение'],
         event: ['✦', 'Событие'], stage: ['💞', 'Этап отношений'], news: ['📰', 'Газета'], stat: ['💗', 'Чувства'],
     };
     const LEVEL_TITLE = { minor: 'Малый штраф', major: 'Серьёзный штраф', critical: 'Критическое последствие' };
@@ -110,6 +173,7 @@
             const d = x.value - x.prev;
             out.push(['stat', `${x.icon} ${x.name} ${d > 0 ? '+' : ''}${d}`, d > 0 ? 'Чувства растут' : 'Чувства остывают']);
         });
+        if (fresh?.fp?.length) out.push(['fp', fresh.fp.map(g => `+${g.amount} · ${g.text}`).join('; '), `+${fresh.fp.reduce((a, g) => a + g.amount, 0)} очков судьбы!`]);
         for (const e of events) if (e.type === 'penalty') out.push(['penalty', e.text, LEVEL_TITLE[e.level] || 'Штраф']);
         (fresh?.ach || []).forEach(a => out.push(['ach', `${a.icon} ${a.title}`, 'Достижение получено!']));
         if (st.hook && st.hook.title !== old.hook?.title) out.push(['event', st.hook.title, 'Новое событие']);
@@ -196,12 +260,16 @@
 
     // если дата события прошла, а итог не подведён, при обновлении просим модель решить: состоялось или пропущено
     function overdueNote(st) {
-        if (!S().mCal || !st?.calendar?.events?.length) return '';
         const now = nowDay(st);
-        if (now == null) return '';
+        if (!st || now == null) return '';
+        const parts = [];
+        const oq = st.quests.filter(q => q.status === 'active' && q.dueDay != null && q.dueDay < now);
+        if (oq.length) parts.push(`The in-story day passed for these quests: ${oq.map(q => `"${q.title}" (id ${q.id}, was due ${fmtDay(q.dueDay)}, penalty: ${q.penalty})`).join('; ')}. Resolve each one now: status "done" if the chat shows it was completed, otherwise "failed" and apply its penalty (lower the related stat, add a penalty event).`);
+        if (!S().mCal || !st.calendar?.events?.length) return parts.join(' ');
         const od = st.calendar.events.filter(e => e.status === 'upcoming' && e.day != null && e.day < now);
-        if (!od.length) return '';
-        return `The in-story date passed for these calendar events: ${od.map(e => `"${e.title}" (id ${e.id}${e.required ? ', required' : ''}${e.quest ? ', quest ' + e.quest : ''})`).join('; ')}. Resolve each one now: status "done" if the chat shows it happened or the player attended, "missed" if not. A missed required event fails its linked quest and causes a penalty.`;
+        if (!od.length) return parts.join(' ');
+        parts.push(`The in-story date passed for these calendar events: ${od.map(e => `"${e.title}" (id ${e.id}${e.required ? ', required' : ''}${e.quest ? ', quest ' + e.quest : ''})`).join('; ')}. Resolve each one now: status "done" if the chat shows it happened or the player attended, "missed" if not. A missed required event fails its linked quest and causes a penalty.`);
+        return parts.join(' ');
     }
 
     // ─── prompts ───────────────────────────────────────────────────────────
@@ -214,7 +282,7 @@
   "shows": "<how the character outwardly behaves, up to 12 words>",
   "hides": "<what the character really feels but hides, up to 12 words>",
   "stats": [{"name": "<Russian name>", "icon": "<emoji>", "value": 0}],
-  "quests": [{"id": "q1", "type": "main|plot|relation|side", "title": "", "desc": "<1 sentence>", "reward": "<short>", "penalty": "<short>", "status": "active|done|failed|locked", "deadline": null}],
+  "quests": [{"id": "q1", "type": "main|plot|relation|side", "title": "", "desc": "<1 sentence>", "reward": "<short>", "penalty": "<short>", "status": "active|done|failed|locked", "due_in_days": null, "hard": false}],
   "rules": ["<short rule of this story's system>"],
   "choices": ["<short action for the player>"],
   "ending": "<one line: where this route is heading>",
@@ -228,7 +296,7 @@
         const s = S();
         let extra = '';
         if (s.mAch) extra += `,
-  "achievements": [{"icon": "<emoji>", "title": "<short>", "desc": "<short>"}]`;
+  "achievements": [{"icon": "<emoji>", "title": "<short>", "desc": "<short>", "fp": 10}]`;
         if (s.mEnd) extra += `,
   "endings": [{"id": "e1", "kind": "good|neutral|bad|true", "title": "", "hint": "<what has to happen>", "progress": 0, "revealed": true}]`;
         if (s.mCal) extra += `,
@@ -239,7 +307,7 @@
     function moduleRules() {
         const s = S();
         let r = '';
-        if (s.mAch) r += `- achievements: only NEW ones clearly earned in the recent chat (a first fight, a confession, a revealed secret, a kept promise...). Usually zero, max 2. Never repeat existing ones.
+        if (s.mAch) r += `- achievements: only NEW ones clearly earned in the recent chat (a first fight, a confession, a revealed secret, a kept promise...). Usually zero, max 2. Never repeat existing ones. fp = 5-25 points by how significant the achievement is.
 `;
         if (s.mEnd) r += `- endings: 3-5 possible story directions (tendencies, not scripts; do not spoil). Keep ids stable. progress 0-100 = how close the story is to each right now. A "true" ending stays revealed=false until the story has clearly opened it. Set "ending" to the one-line direction of the leading route.
 `;
@@ -265,13 +333,13 @@
 
     function compact(st) {
         if (!st) return null;
-        const t = turns();
+        const now = nowDay(st);
         return {
             stage: st.stage, mood: st.mood, thought: st.thought,
             stats: st.stats.map(x => ({ name: x.name, icon: x.icon, value: x.value })),
             quests: st.quests.map(q => ({
                 id: q.id, type: q.type, title: q.title, desc: q.desc, reward: q.reward, penalty: q.penalty,
-                status: q.status, deadline: q.dueTurn ? Math.max(0, q.dueTurn - t) : null,
+                status: q.status, due_in_days: (q.dueDay != null && now != null) ? q.dueDay - now : null, hard: !!q.hard,
             })),
             rules: st.rules,
             memories: (st.memories || []).slice(0, 8).map(m => m.text),
@@ -284,8 +352,8 @@
     function buildPrompts(old, full, note) {
         const c = ctx();
         const s = S();
-        const ch = c.characters?.[c.characterId];
-        const cn = c.name2 || field(ch, 'name') || 'Character';
+        const ch = focusChar();
+        const cn = focusName();
         const un = c.name1 || 'User';
 
         const system = `You are the hidden "System" of an otome-game-style roleplay (like the status windows in otome / isekai manhwa). You read the story and keep a status window for the character ${cn} and the player's persona ${un}. Reply with ONE valid JSON object only: no markdown, no comments, no text outside the JSON. All text values must be in Russian.`;
@@ -305,6 +373,8 @@
             p += `CHARACTER PROFILE (${cn}): ${old.profile || ''}\n\n`;
         }
         p += `PLAYER PERSONA: ${un}\n`;
+        const gi0 = groupInfo();
+        if (gi0) p += `GROUP CHAT with several characters (${gi0.members.map(m => m.name).join(', ')}). Track ONLY ${cn}; all other characters are NPCs for this status window.\n`;
         const ib0 = lastIB();
         if (ib0?.date) p += `IN-STORY DATE (from the chat's infoblock): ${ib0.date}\n`;
         if (s.extra.trim()) p += `PLAYER'S EXTRA WISHES FOR THE SYSTEM: ${s.extra.trim()}\n`;
@@ -317,7 +387,8 @@
 TASK: ${old ? 'Update' : 'Create'} the status window from the story.
 RULES:
 - stats: 3-4 meters that fit THIS story and relationship (for example affection, trust, plus 1-2 story-specific ones). Values 0-100. They change gradually (usually 0-8 per update), more only after major events. Keep the same stat names between updates.
-- quests: keep ids stable. 3-5 active at once: at least one "main" (story goal), the rest a mix of "plot" (intrigue, family, work, danger, mystery), "relation" (romance, trust) and "side". NOT only romance. Each has a short reward and a short penalty (the consequence of failing, e.g. a drop in a stat). deadline = number of turns left, or null.
+- quests: keep ids stable. 3-5 active at once: at least one "main" (story goal), the rest a mix of "plot" (intrigue, family, work, danger, mystery), "relation" (romance, trust) and "side". NOT only romance. Each has a short reward and a short penalty (the consequence of failing, e.g. a drop in a stat). due_in_days = number of in-story days from today until the day the quest must be finished (tie it to a calendar event when possible, 0 = today), or null for an open-ended quest. A quest ends at the end of that day. hard = true only for a notably difficult quest.
+- quests with status "skipped" were closed by the player with a shop token: leave them alone, no reward and no penalty.
 - mark a quest "done" only if the chat clearly fulfilled it, "failed" if it clearly failed. Replace finished quests with new ones that grow out of the story.
 - when a quest is done: raise the related stat and add an event of type "reward". When a quest failed or a rule was broken by the player: lower the related stat and add an event of type "penalty".
 - rules: 2-4 short rules of this story's "system", derived from the setting and the relationship (what the player must or must not do).
@@ -422,20 +493,23 @@ ${buildSchema()}`;
         const fresh = arr(raw.quests).slice(0, 12).map((q, i) => {
             const id = str(q?.id) || ('q' + (i + 1));
             const o = old?.quests?.find(x => x.id === id);
-            const dl = Number(q?.deadline);
-            let due = o?.dueTurn ?? null;
-            if (!due && Number.isFinite(dl) && dl > 0) due = t + Math.round(dl);
-            const status = ['done', 'failed', 'locked'].includes(q?.status) ? q.status : 'active';
+            const raw_in = q?.due_in_days;
+            const din = (raw_in === null || raw_in === undefined || raw_in === '') ? NaN : Number(raw_in);
+            const baseQ = parseDMY(lastIB()?.date) ?? parseDMY(raw.calendar?.today) ?? old?.calendar?.day ?? null;
+            let due = null;
+            if (Number.isFinite(din)) due = baseQ != null ? baseQ + Math.round(din) : (o?.dueDay ?? null);
+            const status = o?.status === 'skipped' ? 'skipped' : (['done', 'failed', 'locked'].includes(q?.status) ? q.status : 'active');
             return {
                 id, type: Q_TYPES.includes(q?.type) ? q.type : 'side',
                 title: str(q?.title), desc: str(q?.desc), reward: str(q?.reward), penalty: str(q?.penalty),
-                status, dueTurn: status === 'active' ? due : null,
+                status, dueDay: status === 'active' ? due : null, hard: q?.hard === true,
+                postponed: o?.postponed || false, asked: o?.asked || false,
             };
         }).filter(q => q.title);
 
         // старые завершённые, которых модель не вернула, сохраняем как историю
         const ids = new Set(fresh.map(q => q.id));
-        const isFin = q => q.status === 'done' || q.status === 'failed';
+        const isFin = q => q.status === 'done' || q.status === 'failed' || q.status === 'skipped';
         const history = (old?.quests || []).filter(q => isFin(q) && !ids.has(q.id));
         const active = fresh.filter(q => q.status === 'active').slice(0, 6);
         const locked = fresh.filter(q => q.status === 'locked').slice(0, 3);
@@ -457,13 +531,13 @@ ${buildSchema()}`;
         st.memories = st.memories.slice(0, 40);
         if (str(raw.hook?.text)) st.hook = { title: str(raw.hook.title) || 'Событие', text: str(raw.hook.text) };
 
-        const fresh2 = { ach: [] };
+        const fresh2 = { ach: [], fp: [] };
         if (S().mAch) {
             const haveA = new Set(st.achievements.map(a => a.title.toLowerCase()));
             for (const a of arr(raw.achievements).slice(0, 2)) {
                 const title = str(a?.title);
                 if (!title || haveA.has(title.toLowerCase())) continue;
-                const item = { turn: t, icon: str(a?.icon) || '🏆', title, desc: str(a?.desc) };
+                const item = { turn: t, icon: str(a?.icon) || '🏆', title, desc: str(a?.desc), fp: clamp(Math.round(Number(a?.fp)) || 10, 5, 25) };
                 st.achievements.unshift(item);
                 fresh2.ach.push(item);
                 haveA.add(title.toLowerCase());
@@ -507,6 +581,35 @@ ${buildSchema()}`;
             st.calendar = { today: str(rc.today), day: base, events: [...upcoming, ...resolved] };
             st.log = st.log.slice(0, 80);
         }
+        // очки судьбы начисляет расширение (не модель) и только один раз за событие
+        const qKey = q => `q:${q.id}:${String(q.title).toLowerCase()}`;
+        const fp = old?.fp ? JSON.parse(JSON.stringify(old.fp)) : { balance: 0, ledger: [], claimed: [], notes: [] };
+        if (!old?.fp && old) {
+            // обновление со старой версии: прошлое задним числом не награждаем
+            for (const q of old.quests || []) if (q.status === 'done') fp.claimed.push(qKey(q));
+            for (const a of old.achievements || []) fp.claimed.push('a:' + String(a.title).toLowerCase());
+            for (const e of old.endings || []) if (e.revealed) fp.claimed.push('e:' + e.id);
+        }
+        const claim = (key, amount, text) => {
+            if (!S().mFP || amount <= 0 || fp.claimed.includes(key)) return;
+            fp.claimed.push(key);
+            fp.balance = num(fp.balance) + amount;
+            fp.ledger.unshift({ turn: t, kind: 'earn', amount, text });
+            fresh2.fp.push({ amount, text });
+        };
+        for (const q of st.quests) {
+            if (q.status === 'done') claim(qKey(q), q.hard ? 35 : ((q.type === 'main' || q.type === 'plot') ? 20 : 10), `Задание «${q.title}»`);
+        }
+        for (const a of fresh2.ach) claim('a:' + a.title.toLowerCase(), a.fp, `Достижение «${a.title}»`);
+        for (const e of st.endings) {
+            const oe = (old?.endings || []).find(x => x.id === e.id);
+            if (oe && !oe.revealed && e.revealed) claim('e:' + e.id, 30, `Открыта концовка «${e.title}»`);
+        }
+        fp.balance = Math.max(0, num(fp.balance));
+        fp.ledger = fp.ledger.slice(0, 60);
+        fp.claimed = fp.claimed.slice(-300);
+        st.fp = fp;
+
         return { st, events, fresh: fresh2 };
     }
 
@@ -521,7 +624,7 @@ ${buildSchema()}`;
             }
             const goals = st.quests.filter(q => q.status === 'active').slice(0, 3).map(q => q.title).join('; ');
             const stats = st.stats.map(x => `${x.name} ${x.value}/100`).join(', ');
-            const name = c.name2 || 'the character';
+            const name = focusName();
             const now = nowDay(st);
             const soon = (s.mCal && now != null) ? (st.calendar?.events || [])
                 .filter(e => e.status === 'upcoming' && e.day != null && e.day - now >= 0 && e.day - now <= 7)
@@ -544,8 +647,8 @@ ${buildSchema()}`;
     async function runUpdate(opts = {}) {
         if (busy) return false;
         const c = ctx();
-        if (!c.characters?.[c.characterId]) {
-            toast('Откройте чат с персонажем, чтобы создать Систему.', 'warning', true);
+        if (!focusChar()) {
+            toast(isGroup() ? 'Выберите героя в верхней части окна Системы.' : 'Откройте чат с персонажем, чтобы создать Систему.', 'warning', true);
             return false;
         }
         busy = true;
@@ -580,7 +683,7 @@ ${buildSchema()}`;
 
     function buildPaperPrompts(st, full) {
         const c = ctx();
-        const cn = c.name2 || 'Character';
+        const cn = focusName();
         const un = c.name1 || 'User';
         const system = `You are the editor of the gossip newspaper of this story's world. You write the latest issue. Reply with ONE valid JSON object only: no markdown, no text outside the JSON. All text values in Russian.`;
         const prevTitles = (st.papers || []).slice(0, 2).flatMap(p => p.headlines.map(h => h.title)).join(' | ');
@@ -640,6 +743,144 @@ JSON SHAPE:
         }
     }
 
+    // ─── очки судьбы: покупки ─────────────────────────────────────────────
+
+    function spend(st, price, text) {
+        st.fp.balance = Math.max(0, num(st.fp.balance) - price);
+        st.fp.ledger.unshift({ turn: turns(), kind: 'spend', amount: price, text });
+        st.fp.ledger = st.fp.ledger.slice(0, 60);
+    }
+
+    // вернуть очки чувств, потерянные из-за штрафа вида «-15 к Доверию»
+    function refundPenalty(st, text) {
+        const norm = v => String(v).toLowerCase().replace(/[^\p{L}]/gu, '');
+        const back = [];
+        for (const m of String(text || '').matchAll(/[−–-]\s*(\d{1,3})\s*к\s+([^,;.()]+)/gi)) {
+            const key = norm(m[2]);
+            const stat = st.stats.find(x => { const n = norm(x.name); return n.length >= 3 && key.length >= 3 && n.slice(0, 5) === key.slice(0, 5); });
+            if (stat) {
+                stat.prev = stat.value;
+                stat.value = clamp(stat.value + Number(m[1]), 0, 100);
+                back.push(`${stat.name} +${m[1]}`);
+            }
+        }
+        return back;
+    }
+
+    function shopTargets(st, pick) {
+        const lab = (t, d) => (d != null ? `${t} · ${fmtDay(d)}` : t);
+        if (pick === 'skip') return st.quests.filter(q => q.status === 'active' && q.type !== 'main').map(q => ({ kind: 'q', id: q.id, label: q.title }));
+        if (pick === 'delay') {
+            return [
+                ...(st.calendar?.events || []).filter(e => e.status === 'upcoming' && !e.postponed && e.day != null).map(e => ({ kind: 'e', id: e.id, label: `📅 ${lab(e.title, e.day)}` })),
+                ...st.quests.filter(q => q.status === 'active' && q.dueDay != null && !q.postponed).map(q => ({ kind: 'q', id: q.id, label: `📜 ${lab(q.title, q.dueDay)}` })),
+            ];
+        }
+        if (pick === 'protect' || pick === 'second') return st.quests.filter(q => q.status === 'failed').map(q => ({ kind: 'q', id: q.id, label: q.title }));
+        return [];
+    }
+
+    function buyLocal(id, kind, targetId) {
+        const st = getState();
+        const it = SHOP.find(x => x.id === id);
+        if (!st || !it) return;
+        if (!st.fp) st.fp = { balance: 0, ledger: [], claimed: [], notes: [] };
+        if (num(st.fp.balance) < it.price) { toast('Не хватает очков судьбы', 'warning', true); return; }
+        const t = turns();
+        const now = nowDay(st);
+        const findQ = status => st.quests.find(x => x.id === targetId && x.status === status);
+        let text = '';
+
+        if (id === 'skip') {
+            const q = findQ('active');
+            if (!q || q.type === 'main') return;
+            q.status = 'skipped';
+            q.dueDay = null;
+            text = `Пропущено задание «${q.title}»`;
+        } else if (id === 'delay') {
+            if (kind === 'e') {
+                const e = (st.calendar?.events || []).find(x => x.id === targetId && x.status === 'upcoming' && !x.postponed);
+                if (!e || e.day == null) return;
+                e.day += 3; e.postponed = true; e.reminded = false; e.todayNotified = false; e.asked = false;
+                text = `Отсрочка на 3 дня: «${e.title}»`;
+            } else {
+                const q = findQ('active');
+                if (!q || q.dueDay == null || q.postponed) return;
+                q.dueDay += 3; q.postponed = true; q.asked = false;
+                text = `Отсрочка на 3 дня: «${q.title}»`;
+            }
+        } else if (id === 'protect') {
+            const q = findQ('failed');
+            if (!q) return;
+            q.status = 'skipped';
+            const back = refundPenalty(st, q.penalty);
+            text = `Штраф отменён: «${q.title}»${back.length ? ' (' + back.join(', ') + ')' : ''}`;
+        } else if (id === 'second') {
+            const q = findQ('failed');
+            if (!q) return;
+            q.status = 'active'; q.asked = false; q.postponed = false;
+            q.dueDay = now != null ? now + 3 : null;
+            text = `Второй шанс: «${q.title}»`;
+        } else {
+            return;
+        }
+
+        spend(st, it.price, it.title);
+        st.log.unshift({ turn: t, type: 'event', level: '', text: `Магазин: ${text}` });
+        setState(st);
+        applyInjection();
+        popup('fp', `${text} · −${it.price} FP`, 'Покупка');
+        render();
+    }
+
+    function buildShopPrompts(st, id, full) {
+        const c = ctx();
+        const cn = focusName();
+        const system = `You are the hidden "System" of an otome-game-style roleplay. Reply with ONE valid JSON object only: no markdown, no text outside the JSON. The text is in Russian. Never write explicit content and never decide what the player does.`;
+        const task = {
+            hint: 'Give ONE hint (2-3 sentences). If there is a locked quest, hint at what will unlock it without stating the condition outright. Otherwise hint at the next plot turn or a thread the player is neglecting. Do not spoil endings.',
+            behind: `Analyze the hidden motives behind ${cn}'s recent behaviour (4-5 sentences), using only what is already written. Do not invent new backstory.`,
+            thread: 'Describe 2-3 plausible consequences of the situation or decision the player faces right now, briefly. These are possibilities, not prophecy.',
+        }[id];
+        let p = `CHARACTER PROFILE (${cn}): ${st.profile || ''}\nRELATIONSHIP STAGE: ${st.stage}\n`;
+        p += `STATS: ${st.stats.map(x => `${x.name} ${x.value}`).join(', ')}\n`;
+        p += `ACTIVE QUESTS: ${st.quests.filter(q => q.status === 'active').map(q => q.title).join('; ') || 'none'}\n`;
+        const lk = st.quests.filter(q => q.status === 'locked');
+        if (lk.length) p += `LOCKED QUESTS (unlock conditions): ${lk.map(q => `${q.title}: ${q.desc}`).join('; ')}\n`;
+        p += full ? '\nThe recent chat is the conversation above.\n' : `\nRECENT CHAT:\n${recent(8, 900)}\n`;
+        p += `\nTASK: ${task}\nJSON SHAPE: {"text": "<answer>"}`;
+        return { system, prompt: p };
+    }
+
+    async function buyAI(id) {
+        if (busy) return;
+        const st = getState();
+        const it = SHOP.find(x => x.id === id);
+        if (!st || !it) return;
+        if (num(st.fp?.balance) < it.price) { toast('Не хватает очков судьбы', 'warning', true); return; }
+        busy = true;
+        setBusyUI(true);
+        try {
+            const { system, prompt } = buildShopPrompts(st, id, S().fullPreset);
+            const raw = await callLLM(system, prompt, S().fullPreset);
+            const text = str(raw?.text);
+            if (!text) { toast('Не удалось получить ответ. Очки не списаны.', 'error', true); return; }
+            const cur = getState() || st;
+            spend(cur, it.price, it.title);
+            cur.fp.notes = [{ turn: turns(), title: it.title, text }, ...(cur.fp.notes || [])].slice(0, 20);
+            cur.log.unshift({ turn: turns(), type: 'event', level: '', text: `Магазин: ${it.title}` });
+            setState(cur);
+            popup('fp', `${it.title} · −${it.price} FP`, 'Покупка');
+            render();
+        } catch (e) {
+            console.error(`[${EXT}]`, e);
+            toast('Ошибка покупки, очки не списаны.', 'error', true);
+        } finally {
+            busy = false;
+            setBusyUI(false);
+        }
+    }
+
     function onMessage() {
         const s = S();
         if (!s.enabled) return;
@@ -647,20 +888,7 @@ JSON SHAPE:
         if (!st) { render(); return; }
         const t = turns();
 
-        // просроченные задания → штраф
-        const expired = st.quests.filter(q => q.status === 'active' && q.dueTurn && q.dueTurn <= t);
         let note = '';
-        if (expired.length) {
-            for (const q of expired) {
-                q.status = 'failed';
-                q.dueTurn = null;
-                st.log.unshift({ turn: t, type: 'penalty', text: `Время вышло: «${q.title}». Штраф: ${q.penalty || '—'}` });
-                popup('penalty', `Время вышло: «${q.title}». Штраф: ${q.penalty || '—'}`, 'Задание просрочено');
-            }
-            note = `The timer just failed these quests: ${expired.map(q => `"${q.title}" (penalty: ${q.penalty})`).join('; ')}. Lower the related stats accordingly, but do NOT add events for them (already logged).`;
-            setState(st);
-            if (!isOpen()) { unseen = true; updateFabDot(); }
-        }
 
         // календарь: напоминания и просроченные события
         let calDue = false;
@@ -688,7 +916,23 @@ JSON SHAPE:
             }
         }
 
-        if (s.auto && (expired.length || calDue || t - (st.lastTurn || 0) >= s.every)) {
+        // задания с датой: когда день прошёл, просим подвести итог
+        if (nowD != null) {
+            let qChanged = false;
+            for (const q of st.quests) {
+                if (q.status === 'active' && q.dueDay != null && q.dueDay < nowD && !q.asked) {
+                    q.asked = true;
+                    qChanged = true;
+                    calDue = true;
+                }
+            }
+            if (qChanged) {
+                setState(st);
+                if (!isOpen()) { unseen = true; updateFabDot(); }
+            }
+        }
+
+        if (s.auto && (calDue || t - (st.lastTurn || 0) >= s.every)) {
             setTimeout(() => runUpdate({ note }), 700);
         } else {
             render();
@@ -707,6 +951,12 @@ JSON SHAPE:
     function updateFabDot() { document.getElementById('otm-fab')?.classList.toggle('dot', unseen); }
 
     function emptyView() {
+        const gi = groupInfo();
+        if (gi && !focusKey()) {
+            return `<div class="otm-empty"><div class="otm-big">✦</div><div class="otm-etitle">Выберите героя</div>
+                <div class="otm-edesc">Это групповой чат. Система развивает отношения с одним героем за раз, переключаться можно в любой момент, у каждого свой прогресс.</div>
+                <div class="otm-choices" style="width:100%">${gi.members.map(m => `<button class="otm-choice" data-act="hero" data-av="${esc(m.avatar)}">${esc(m.name)}</button>`).join('')}</div></div>`;
+        }
         return `<div class="otm-empty">
             <div class="otm-big">✦</div>
             <div class="otm-etitle">Система не создана</div>
@@ -725,22 +975,22 @@ JSON SHAPE:
 
     function portrait() {
         const c = ctx();
-        const ch = c.characters?.[c.characterId];
+        const ch = focusChar();
         if (!ch?.avatar) return '<div class="otm-portrait-wrap"><span class="otm-noimg">✦</span></div>';
         let url = `/thumbnail?type=avatar&file=${encodeURIComponent(ch.avatar)}`;
         try { if (typeof c.getThumbnailUrl === 'function') url = c.getThumbnailUrl('avatar', ch.avatar) || url; } catch (e) { /* запасной адрес */ }
-        return `<div class="otm-portrait-wrap"><span class="otm-noimg">✦</span><img class="otm-portrait" src="${esc(url)}" alt="" onerror="this.remove()"></div>`;
+        return `<div class="otm-portrait-wrap"><span class="otm-noimg">✦</span><img class="otm-portrait" src="${esc(url)}" alt=""></div>`;
     }
 
     function viewStatus(st) {
         if (!st) return emptyView();
-        const name = esc(ctx().name2 || 'Персонаж');
+        const name = esc(focusName());
         const stats = st.stats.map(x => {
             const d = x.value - x.prev;
             const dh = d ? `<em class="${d > 0 ? 'up' : 'down'}">${d > 0 ? '▲' : '▼'}${Math.abs(d)}</em>` : '';
             return `<div class="otm-stat">
-                <div class="otm-srow"><span>${esc(x.icon)} ${esc(x.name)}</span><b>${x.value}${dh}</b></div>
-                <div class="otm-bar"><i style="width:${x.value}%"></i></div>
+                <div class="otm-srow"><span>${esc(x.icon)} ${esc(x.name)}</span><b>${num(x.value)}${dh}</b></div>
+                <div class="otm-bar"><i style="width:${pct(x.value)}%"></i></div>
             </div>`;
         }).join('');
         const choices = st.choices.map((x, i) => `<button class="otm-choice" data-act="choice" data-i="${i}">${esc(x)}</button>`).join('');
@@ -767,17 +1017,16 @@ JSON SHAPE:
 
     function viewQuests(st) {
         if (!st) return emptyView();
-        const t = turns();
         const nowQ = nowDay(st);
         const active = st.quests.filter(q => q.status === 'active');
-        const done = st.quests.filter(q => q.status === 'done' || q.status === 'failed');
+        const done = st.quests.filter(q => q.status === 'done' || q.status === 'failed' || q.status === 'skipped');
         const locked = st.quests.filter(q => q.status === 'locked');
         const card = q => {
-            const left = q.dueTurn ? Math.max(0, q.dueTurn - t) : null;
+            const dueTxt = (q.dueDay != null && nowQ != null) ? (q.dueDay < nowQ ? '⏳ ждёт итогов' : `📅 до ${fmtDay(q.dueDay)} · ${rel(q.dueDay, nowQ)}`) : '';
             const ev = (st.calendar?.events || []).filter(e => e.quest === q.id && e.status === 'upcoming')
                 .map(e => `<div class="otm-qev">📅 ${esc(e.title)}${e.day != null && nowQ != null ? ' · ' + rel(e.day, nowQ) : ''}</div>`).join('');
             return `<div class="otm-q otm-${esc(q.type)}">
-                <div class="otm-qh"><span class="otm-chip">${Q_LABEL[q.type]}</span>${left !== null ? `<span class="otm-due">⏳ ${left} ход.</span>` : ''}</div>
+                <div class="otm-qh"><span class="otm-chip">${Q_LABEL[q.type]}</span>${q.hard ? '<span class="otm-hardtag">СЛОЖНОЕ</span>' : ''}${dueTxt ? `<span class="otm-due">${dueTxt}</span>` : ''}</div>
                 <div class="otm-qt">${esc(q.title)}</div>
                 <div class="otm-qd">${esc(q.desc)}</div>
                 ${ev}
@@ -789,7 +1038,7 @@ JSON SHAPE:
             ${active.map(card).join('') || '<div class="otm-none">Нет активных заданий</div>'}
             ${locked.length ? `<div class="otm-sec">Скрытые задания</div>${locked.map(q => `<div class="otm-q otm-locked"><div class="otm-qt">🔒 ???</div><div class="otm-qd">Условие: ${esc(q.desc)}</div></div>`).join('')}` : ''}
             ${st.rules.length ? `<div class="otm-sec">Правила Системы</div><ul class="otm-rules">${st.rules.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
-            ${done.length ? `<div class="otm-sec">Завершённые</div>${done.map(q => `<div class="otm-fin ${q.status}">${q.status === 'done' ? '✔' : '✖'} ${esc(q.title)}</div>`).join('')}` : ''}`;
+            ${done.length ? `<div class="otm-sec">Завершённые</div>${done.map(q => `<div class="otm-fin ${cls(q.status)}">${q.status === 'done' ? '✔' : (q.status === 'skipped' ? '⏭' : '✖')} ${esc(q.title)}</div>`).join('')}` : ''}`;
     }
 
     const LOG_ICON = { reward: '🎁', penalty: '⚠️', quest: '📜', event: '✦', moment: '💫' };
@@ -799,9 +1048,9 @@ JSON SHAPE:
 
     function viewLog(st) {
         if (!st) return emptyView();
-        const ev = st.log.slice(0, 30).map(e => `<div class="otm-log ${e.type}"><span>${LOG_ICON[e.type] || '✦'}</span><div>${e.level ? `<b class="otm-lv ${e.level}">${LEVEL[e.level]}</b> ` : ''}${esc(e.text)}<small>ход ${e.turn}</small></div></div>`).join('');
-        const mem = (st.memories || []).slice(0, 15).map(e => `<div class="otm-mem">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('');
-        const dia = (st.diary || []).slice(0, 10).map(e => `<div class="otm-dia">${esc(e.text)}<small>ход ${e.turn}</small></div>`).join('');
+        const ev = st.log.slice(0, 30).map(e => `<div class="otm-log ${cls(e.type)}"><span>${LOG_ICON[e.type] || '✦'}</span><div>${e.level ? `<b class="otm-lv ${cls(e.level)}">${LEVEL[e.level]}</b> ` : ''}${esc(e.text)}<small>ход ${num(e.turn)}</small></div></div>`).join('');
+        const mem = (st.memories || []).slice(0, 15).map(e => `<div class="otm-mem">${esc(e.text)}<small>ход ${num(e.turn)}</small></div>`).join('');
+        const dia = (st.diary || []).slice(0, 10).map(e => `<div class="otm-dia">${esc(e.text)}<small>ход ${num(e.turn)}</small></div>`).join('');
         return `${section('События')}${ev || '<div class="otm-none">Пока пусто</div>'}${mem ? section('Память: обещания, конфликты, секреты') + mem : ''}${dia ? section('Дневник героя') + dia : ''}`;
     }
 
@@ -908,7 +1157,7 @@ JSON SHAPE:
             <button class="otm-mini-btn" data-act="news" data-i="${paperIdx}" data-j="${j}">➜ в сюжет</button></article>`).join('');
         return `<div class="otm-paper">
             <div class="otm-mast">${esc(p.paper || 'Вестник')}</div>
-            <div class="otm-issue">${esc(p.date || '')}${p.date ? ' · ' : ''}ход ${p.turn}</div>
+            <div class="otm-issue">${esc(p.date || '')}${p.date ? ' · ' : ''}ход ${num(p.turn)}</div>
             ${items}${p.ad ? `<div class="otm-ad">${esc(p.ad)}</div>` : ''}
             </div>
             <div class="otm-pager"><button class="otm-mini-btn" data-act="pprev" ${paperIdx >= papers.length - 1 ? 'disabled' : ''}>‹ раньше</button><span>${paperIdx + 1} / ${papers.length}</span><button class="otm-mini-btn" data-act="pnext" ${paperIdx <= 0 ? 'disabled' : ''}>новее ›</button></div>
@@ -918,7 +1167,7 @@ JSON SHAPE:
     function viewCollection(st) {
         if (!st) return emptyView();
         const achs = st.achievements || [];
-        const ach = achs.map(a => `<div class="otm-ach"><span>${esc(a.icon)}</span><div><b>${esc(a.title)}</b><small>${esc(a.desc)} · ход ${a.turn}</small></div></div>`).join('');
+        const ach = achs.map(a => `<div class="otm-ach"><span>${esc(a.icon)}</span><div><b>${esc(a.title)}</b><small>${esc(a.desc)} · ход ${num(a.turn)}${a.fp ? ' · +' + num(a.fp) + ' FP' : ''}</small></div></div>`).join('');
         return `${section(`Достижения · ${achs.length}`)}${ach || '<div class="otm-none">Пока ни одного. Всё впереди ✦</div>'}`;
     }
 
@@ -929,9 +1178,42 @@ JSON SHAPE:
         const list = [...(st.endings || [])].sort((a, b) => b.progress - a.progress);
         if (!list.length) return `<div class="otm-none">${st.ending ? esc(st.ending) : 'Направления появятся после обновления Системы.'}</div>`;
         return list.map(e => e.revealed
-            ? `<div class="otm-end ${e.kind}"><div class="otm-qh"><span class="otm-chip">${KIND[e.kind]}</span><span class="otm-due">${e.progress}%</span></div><div class="otm-qt">${esc(e.title)}</div><div class="otm-qd">${esc(e.hint)}</div><div class="otm-bar"><i style="width:${e.progress}%"></i></div></div>`
+            ? `<div class="otm-end ${cls(e.kind)}"><div class="otm-qh"><span class="otm-chip">${KIND[e.kind]}</span><span class="otm-due">${pct(e.progress)}%</span></div><div class="otm-qt">${esc(e.title)}</div><div class="otm-qd">${esc(e.hint)}</div><div class="otm-bar"><i style="width:${pct(e.progress)}%"></i></div></div>`
             : `<div class="otm-end otm-locked"><div class="otm-qh"><span class="otm-chip">${KIND[e.kind]}</span></div><div class="otm-qt">🔒 ???</div><div class="otm-qd">Эта концовка ещё не открыта</div></div>`).join('')
             + '<div class="otm-hint">Это тенденции, а не жёсткие сценарии: история может свернуть куда угодно.</div>';
+    }
+
+    const SHOP = [
+        { id: 'skip', icon: '⏭️', title: 'Пропуск задания', desc: 'Закрыть побочное задание без штрафа и без награды. Главное пропустить нельзя.', price: 50, pick: true },
+        { id: 'delay', icon: '⏳', title: 'Отсрочка', desc: 'Сдвинуть срок события или задания на 3 дня вперёд (один раз для каждого).', price: 35, pick: true },
+        { id: 'protect', icon: '🛡️', title: 'Защита от штрафа', desc: 'Отменить последствие проваленного задания и вернуть потерянные из-за него очки чувств.', price: 60, pick: true },
+        { id: 'second', icon: '🔁', title: 'Второй шанс', desc: 'Вернуть проваленное задание в активные, срок 3 дня.', price: 45, pick: true },
+        { id: 'hint', icon: '🔮', title: 'Подсказка судьбы', desc: 'Намёк на скрытое условие или ближайший поворот сюжета.', price: 25 },
+        { id: 'behind', icon: '🎭', title: 'Взгляд за кулисы', desc: 'Разбор скрытых мотивов героя по уже написанной истории.', price: 40 },
+        { id: 'thread', icon: '🧵', title: 'Нить судьбы', desc: 'Возможные последствия решения, перед которым вы сейчас стоите.', price: 30 },
+    ];
+    let shopPick = null;
+
+    function viewShop(st) {
+        if (!st) return emptyView();
+        if (!S().mFP) return '<div class="otm-none">Магазин выключен в настройках.</div>';
+        const fp = st.fp || { balance: 0, ledger: [], notes: [] };
+        const bal = num(fp.balance);
+        if (shopPick) {
+            const it = SHOP.find(x => x.id === shopPick);
+            const targets = shopTargets(st, shopPick);
+            return `${section(esc(it?.title || ''))}<div class="otm-qd">Выберите, к чему применить:</div>
+                <div class="otm-choices" style="margin-top:8px">${targets.map(tg => `<button class="otm-choice" data-act="shoptarget" data-kind="${cls(tg.kind)}" data-id="${esc(tg.id)}">${esc(tg.label)}</button>`).join('') || '<div class="otm-none">Подходящих целей сейчас нет</div>'}</div>
+                <div class="otm-foot2"><button class="otm-btn" data-act="shopcancel">Отмена</button></div>`;
+        }
+        const items = SHOP.map(it => `<div class="otm-item"><span class="otm-itic">${it.icon}</span><div class="otm-itb"><b>${esc(it.title)}</b><small>${esc(it.desc)}</small></div><button class="otm-btn" data-act="buy" data-id="${it.id}" ${bal < it.price ? 'disabled' : ''}>${it.price} FP</button></div>`).join('');
+        const notes = (fp.notes || []).slice(0, 6).map(n => `<div class="otm-note"><b>${esc(n.title)}</b><p>${esc(n.text)}</p><small>ход ${num(n.turn)}</small></div>`).join('');
+        const led = (fp.ledger || []).slice(0, 10).map(l => `<div class="otm-led ${l.kind === 'earn' ? 'earn' : 'spend'}"><span>${l.kind === 'earn' ? '+' : '−'}${num(l.amount)}</span>${esc(l.text)}</div>`).join('');
+        return `<div class="otm-wallet"><span>💎</span><div><b>${bal} FP</b><small>очки судьбы</small></div></div>
+            <div class="otm-hint" style="text-align:left;margin:8px 0 0">За задания: 10 (обычное), 20 (сюжетное), 35 (сложное). За достижения 5–25, за открытую концовку 30. Каждое событие награждается один раз.</div>
+            ${section('Магазин')}${items}
+            <div class="otm-hint">Магазин не продаёт чувства: любовь, доверие и послушание героя купить нельзя. Он меняет условия игры и открывает информацию.</div>
+            ${notes ? section('Купленные записи') + notes : ''}${led ? section('Журнал очков') + led : ''}`;
     }
 
     function viewSettings() {
@@ -941,13 +1223,14 @@ JSON SHAPE:
         return `
             ${chk('enabled', 'Система включена')}
             ${chk('auto', 'Автообновление', 'Отдельный запрос к модели раз в несколько ответов')}
-            <label class="otm-row"><span>Обновлять каждые <input type="number" min="1" max="20" data-set="every" value="${s.every}" class="otm-num"> ответов</span></label>
+            <label class="otm-row"><span>Обновлять каждые <input type="number" min="1" max="20" data-set="every" value="${num(s.every)}" class="otm-num"> ответов</span></label>
             ${chk('frozen', 'Заморозить чувства', 'Настроение, показатели и мысли не меняются. Задания, события и память обновляются')}
             <label class="otm-row otm-sel"><span>Тема окна</span><select data-set="theme" class="otm-select">${[['pink', 'Розовая'], ['lavender', 'Лавандовая'], ['wine', 'Винная'], ['auto', 'От темы ST']].map(([v, l]) => `<option value="${v}" ${s.theme === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
             ${chk('cute', 'Милые всплывающие окна', 'Как уведомления в манхве. Выключите, чтобы получать обычные окна таверны')}
             ${chk('mAch', 'Достижения', 'Входят в обновления, добавляют немного токенов')}
             ${chk('mEnd', 'Архив концовок')}
             ${chk('mCal', 'Календарь и события')}
+            ${chk('mFP', 'Очки судьбы и магазин', 'Очки за выполненные задания, достижения и концовки; траты в магазине')}
             ${chk('inject', 'Подмешивать состояние в промпт', 'Персонаж ведёт себя по настроению и чувствам (около 80 токенов)')}
             ${chk('notify', 'Всплывающие уведомления')}
             ${chk('floating', 'Плавающая кнопка на экране')}
@@ -970,11 +1253,29 @@ JSON SHAPE:
         const body = document.getElementById('otm-body');
         if (!body) return;
         const st = getState();
-        const views = { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog };
+        const views = { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, shop: viewShop };
         body.innerHTML = tab === 'settings' ? viewSettings() : views[tab](st);
         document.querySelectorAll('#otm-modal .otm-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+        const hb = document.getElementById('otm-heroes');
+        if (hb) {
+            const gi = groupInfo();
+            if (!gi) { hb.innerHTML = ''; hb.style.display = 'none'; }
+            else {
+                hb.style.display = '';
+                const fk = focusKey();
+                hb.innerHTML = gi.members.map(m => `<button class="otm-hero${m.avatar === fk ? ' active' : ''}" data-act="hero" data-av="${esc(m.avatar)}">${esc(m.name)}</button>`).join('');
+            }
+        }
+        const fpEl = document.getElementById('otm-fp');
+        if (fpEl) {
+            const on = S().mFP && st;
+            fpEl.textContent = on ? `💎 ${num(st.fp?.balance)} FP` : '';
+            fpEl.style.display = on ? '' : 'none';
+        }
+        const shopTab = document.querySelector('#otm-modal [data-tab="shop"]');
+        if (shopTab) shopTab.style.display = S().mFP ? '' : 'none';
         const sub = document.getElementById('otm-sub');
-        if (sub) sub.textContent = st ? (ctx().name2 || '') : '';
+        if (sub) sub.textContent = st ? focusName() : '';
     }
 
     function openPanel() {
@@ -997,6 +1298,7 @@ JSON SHAPE:
             <div class="otm-window">
                 <div class="otm-head">
                     <div class="otm-title">✦ СИСТЕМА ♡ <span id="otm-sub"></span><span class="otm-spin">⏳</span></div>
+                    <span id="otm-fp" class="otm-fp"></span>
                     <button class="otm-x" data-act="close">✕</button>
                 </div>
                 <div class="otm-tabs">
@@ -1007,15 +1309,22 @@ JSON SHAPE:
                     <button class="otm-tab" data-tab="collection">Достижения</button>
                     <button class="otm-tab" data-tab="endings">Концовки</button>
                     <button class="otm-tab" data-tab="log">Журнал</button>
+                    <button class="otm-tab" data-tab="shop">Магазин</button>
                     <button class="otm-tab" data-tab="settings">⚙</button>
                 </div>
+                <div class="otm-heroes" id="otm-heroes" style="display:none"></div>
                 <div class="otm-body" id="otm-body"></div>
             </div>`;
         document.body.appendChild(m);
 
+        // если аватарка не загрузилась, остаётся значок ✦ (без inline-JS в разметке)
+        m.addEventListener('error', e => {
+            if (e.target?.classList?.contains('otm-portrait')) e.target.remove();
+        }, true);
+
         m.addEventListener('click', async e => {
             const tabBtn = e.target.closest('[data-tab]');
-            if (tabBtn) { tab = tabBtn.dataset.tab; render(); return; }
+            if (tabBtn) { tab = tabBtn.dataset.tab; shopPick = null; render(); return; }
             const el = e.target.closest('[data-act]');
             if (!el) return;
             const act = el.dataset.act;
@@ -1040,6 +1349,22 @@ JSON SHAPE:
                     closePanel();
                     ta.focus();
                 }
+            } else if (act === 'hero') {
+                setFocus(el.dataset.av);
+            } else if (act === 'buy') {
+                const it = SHOP.find(x => x.id === el.dataset.id);
+                if (!it) return;
+                if (it.pick) { shopPick = it.id; render(); }
+                else await buyAI(it.id);
+            } else if (act === 'shoptarget') {
+                if (shopPick) {
+                    const id0 = shopPick;
+                    shopPick = null;
+                    buyLocal(id0, el.dataset.kind, el.dataset.id);
+                }
+            } else if (act === 'shopcancel') {
+                shopPick = null;
+                render();
             } else if (act === 'calprev') {
                 calOff--;
                 render();
@@ -1212,7 +1537,7 @@ JSON SHAPE:
     // ─── init ──────────────────────────────────────────────────────────────
 
     if (globalThis.__OTOME_TEST__) {
-        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, buildPrompts, compact, cut, clean, seasonOf, lastIB, buildPaperPrompts, announce, parseDMY, nowDay, overdueNote, rel, fmtFull, monthGrid, views: { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, settings: viewSettings } });
+        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, buildPrompts, compact, cut, clean, seasonOf, lastIB, buildPaperPrompts, announce, isGroup, groupInfo, focusKey, focusChar, setFocus, getState, setState, buyLocal, SHOP, parseDMY, nowDay, overdueNote, rel, fmtFull, monthGrid, views: { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, shop: viewShop, settings: viewSettings } });
     }
 
     jQuery(async () => {
