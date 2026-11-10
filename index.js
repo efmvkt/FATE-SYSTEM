@@ -15,6 +15,7 @@
         notify: true,      // всплывающие уведомления
         floating: true,    // плавающая кнопка
         fullPreset: false, // обновлять через полный пресет (дороже, экспериментально)
+        profileId: '',     // профиль подключения для запросов Системы ('' = основное подключение)
         frozen: false,     // заморозить чувства: задания, события и память продолжают обновляться
         theme: 'pink',     // pink | lavender | wine | auto
         cute: true,        // милые всплывающие окна
@@ -420,6 +421,25 @@ ${buildSchema()}`;
     async function callLLM(system, prompt, full) {
         const c = ctx();
         const LEN = 2500;
+
+        // выбран отдельный профиль подключения: все запросы Системы идут через него (дешёвая модель)
+        const pid = S().profileId;
+        if (pid && c.ConnectionManagerRequestService) {
+            try {
+                const r = await c.ConnectionManagerRequestService.sendRequest(
+                    pid,
+                    [{ role: 'system', content: system }, { role: 'user', content: prompt }],
+                    LEN,
+                );
+                const j = extractJson(r?.content || '');
+                if (j) return j;
+            } catch (e) {
+                console.warn(`[${EXT}] profile request failed`, e);
+                toast('Профиль подключения не ответил. Проверьте профиль в Connection Profile.', 'error', true);
+            }
+            return null; // осознанно без фолбэка, чтобы запрос не ушёл на дорогую основную модель
+        }
+
         const list = [];
         if (full && typeof c.generateQuietPrompt === 'function') {
             const q = system + '\n\n' + prompt;
@@ -1220,12 +1240,14 @@ JSON SHAPE:
     function viewSettings() {
         const s = S();
         const cur = getState();
+        const profiles = ctx().extensionSettings?.connectionManager?.profiles || [];
         const chk = (k, label, hint = '') => `<label class="otm-row"><input type="checkbox" data-set="${k}" ${s[k] ? 'checked' : ''}><span>${label}${hint ? `<small>${hint}</small>` : ''}</span></label>`;
         return `
             ${chk('enabled', 'Система включена')}
             ${chk('auto', 'Автообновление', 'Отдельный запрос к модели раз в несколько ответов')}
             <label class="otm-row"><span>Обновлять каждые <input type="number" min="1" max="20" data-set="every" value="${num(s.every)}" class="otm-num"> ответов</span></label>
             ${chk('frozen', 'Заморозить чувства', 'Настроение, показатели и мысли не меняются. Задания, события и память обновляются')}
+            <label class="otm-row otm-sel"><span>Профиль подключения<small>Дешёвая модель для запросов Системы. Профили создаются в Connection Profile. Если выбран, «полный пресет» не используется</small></span><select data-set="profileId" class="otm-select"><option value="">Основное подключение</option>${profiles.map(p => `<option value="${esc(p.id)}" ${s.profileId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
             <label class="otm-row otm-sel"><span>Тема окна</span><select data-set="theme" class="otm-select">${[['pink', 'Розовая'], ['lavender', 'Лавандовая'], ['wine', 'Винная'], ['auto', 'От темы ST']].map(([v, l]) => `<option value="${v}" ${s.theme === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
             ${chk('cute', 'Милые всплывающие окна', 'Как уведомления в манхве. Выключите, чтобы получать обычные окна таверны')}
             ${chk('mAch', 'Достижения', 'Входят в обновления, добавляют немного токенов')}
