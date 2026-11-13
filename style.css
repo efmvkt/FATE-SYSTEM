@@ -551,3 +551,51 @@
 .otm-heroes::-webkit-scrollbar { display: none; }
 .otm-hero { flex: none; padding: 6px 14px; border: 1px solid var(--otm-line); border-radius: 999px; background: var(--otm-soft); color: var(--otm-muted); font-size: 12px; font-weight: 600; cursor: pointer; }
 .otm-hero.active { background: var(--otm-soft3); border-color: var(--otm-line2); color: var(--otm-text); box-shadow: 0 0 10px var(--otm-soft3); }
+
+/* ═══════════════ телефон героя ═══════════════ */
+.otm-phone-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 6px 0; }
+.otm-app {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 14px 4px;
+    border: 1px solid var(--otm-line);
+    border-radius: 16px;
+    background: var(--otm-card);
+    color: var(--otm-text);
+    font-size: 12px;
+    cursor: pointer;
+}
+.otm-app:active { background: var(--otm-soft2); }
+.otm-app span { font-size: 28px; line-height: 1; }
+.otm-app em {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    box-sizing: border-box;
+    border-radius: 9px;
+    background: var(--otm-bad);
+    color: #fff;
+    font: 700 11px/18px -apple-system, 'Segoe UI', sans-serif;
+    font-style: normal;
+    text-align: center;
+}
+.otm-phonebar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.otm-phonebar b { flex: 1; color: var(--otm-accent); font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; }
+.otm-pitem { display: block; padding: 9px 12px; margin-bottom: 6px; border: 1px solid var(--otm-line); border-radius: 12px; background: var(--otm-card); font-size: 13px; }
+.otm-pitem small { display: block; margin-top: 2px; color: var(--otm-muted); font-size: 11px; }
+.otm-pbtn { width: 100%; text-align: left; color: var(--otm-text); font-family: inherit; cursor: pointer; }
+.otm-pbtn:active { background: var(--otm-soft2); }
+.otm-tx { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.otm-amt { flex: none; font-variant-numeric: tabular-nums; }
+.otm-amt.plus { color: var(--otm-good); }
+.otm-amt.minus { color: var(--otm-bad); }
+.otm-bubbles { display: flex; flex-direction: column; gap: 6px; }
+.otm-bub { max-width: 82%; padding: 8px 12px; border-radius: 16px 16px 16px 4px; background: var(--otm-card); border: 1px solid var(--otm-line); align-self: flex-start; font-size: 13px; overflow-wrap: anywhere; }
+.otm-bub.me { align-self: flex-end; border-radius: 16px 16px 4px 16px; background: var(--otm-soft3); border-color: var(--otm-line2); }
+.otm-bub small { display: block; margin-top: 3px; color: var(--otm-muted); font-size: 10px; }
