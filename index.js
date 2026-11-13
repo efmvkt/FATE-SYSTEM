@@ -768,7 +768,7 @@ JSON SHAPE:
 
     // ─── телефон героя ─────────────────────────────────────────────────────
 
-    const PH_APPS = [['contacts', '👥', 'Контакты'], ['messages', '💬', 'Сообщения'], ['browser', '🌐', 'Браузер'], ['bank', '🏦', 'Банк'], ['notes', '📝', 'Заметки'], ['gallery', '🖼️', 'Галерея']];
+    const PH_APPS = [['contacts', '👥', 'Контакты'], ['browser', '🌐', 'Браузер'], ['bank', '🏦', 'Банк'], ['notes', '📝', 'Заметки']];
 
     function buildPhonePrompts(st, full) {
         const c = ctx();
@@ -790,14 +790,13 @@ TASK: ${st.phone ? 'Update' : 'Create'} the content of ${cn}'s phone.
 RULES:
 - The phone is what ${cn} would really own in this setting. If there are no phones in this world (fantasy, historical), make an in-world equivalent (enchanted mirror, magic tablet, etc.) and adapt the currency and the bank (banking house, guild treasury...).
 - contacts: 5-8 people from ${cn}'s life (family, work, friends, rivals, staff). Include ${un}, saved under the name or nickname ${cn} would REALLY use: it reveals feelings and may change with the relationship stage.
-- chats: 3-5 conversations with 3-8 messages each, in the voices of the people, consistent with the profile and the chat. "me" = ${cn}. Messages may hint at what ${cn} hides, but must not resolve the plot or contradict the chat. When updating, add messages that follow the latest events and keep max 8 per chat. unread=true for chats with fresh messages.
 - bank: balance and 5-8 transactions that fit ${cn}'s job and status. amount is signed (expense < 0). One or two items may quietly hint at the plot or at ${un} (a gift, an odd expense), only if it fits.
 - searches: 4-6 recent browser queries that reveal ${cn}'s worries and plans.
-- notes: 2-3 short notes (lists, drafts, unsent messages). gallery: 3-5 photo captions describing what the photo shows.
+- notes: 2-3 short notes (lists, drafts, unsent messages).
 - The phone only knows what ${cn} knows and did.
 
 JSON SHAPE:
-{"device": "<what the device is called in this world>", "contacts": [{"id": "p1", "name": "<as saved>", "relation": "<short>", "note": ""}], "chats": [{"id": "m1", "with": "<contact name>", "unread": false, "messages": [{"from": "me|them", "text": "", "time": "HH:MM"}]}], "bank": {"name": "", "currency": "", "balance": 0, "tx": [{"title": "", "amount": 0, "when": "<short>"}]}, "searches": [{"query": "", "when": "<short>"}], "notes": [{"title": "", "text": ""}], "gallery": [{"caption": "", "when": ""}]}`;
+{"device": "<what the device is called in this world>", "contacts": [{"id": "p1", "name": "<as saved>", "relation": "<short>", "note": ""}], "bank": {"name": "", "currency": "", "balance": 0, "tx": [{"title": "", "amount": 0, "when": "<short>"}]}, "searches": [{"query": "", "when": "<short>"}], "notes": [{"title": "", "text": ""}]}`;
         return { system, prompt: p };
     }
 
@@ -807,10 +806,6 @@ JSON SHAPE:
         return {
             device: str(raw.device) || old?.device || 'Телефон',
             contacts: arr(raw.contacts).slice(0, 10).map((x, i) => ({ id: str(x?.id) || 'p' + (i + 1), name: str(x?.name), relation: str(x?.relation), note: str(x?.note) })).filter(x => x.name),
-            chats: arr(raw.chats).slice(0, 6).map((x, i) => ({
-                id: str(x?.id) || 'm' + (i + 1), with: str(x?.with), unread: x?.unread === true,
-                messages: arr(x?.messages).slice(-10).map(m => ({ from: m?.from === 'me' ? 'me' : 'them', text: str(m?.text), time: str(m?.time) })).filter(m => m.text),
-            })).filter(x => x.with && x.messages.length),
             bank: {
                 name: str(b.name) || old?.bank?.name || 'Банк', currency: str(b.currency) || old?.bank?.currency || '₽',
                 balance: Math.round(num(b.balance)),
@@ -818,7 +813,6 @@ JSON SHAPE:
             },
             searches: arr(raw.searches).slice(0, 8).map(x => ({ query: str(x?.query), when: str(x?.when) })).filter(x => x.query),
             notes: arr(raw.notes).slice(0, 5).map(x => ({ title: str(x?.title), text: str(x?.text) })).filter(x => x.title || x.text),
-            gallery: arr(raw.gallery).slice(0, 6).map(x => ({ caption: str(x?.caption), when: str(x?.when) })).filter(x => x.caption),
             turn: turns(), updatedAt: Date.now(),
         };
     }
@@ -840,9 +834,7 @@ JSON SHAPE:
             const hadPhone = !!cur.phone;
             cur.phone = normPhone(raw, cur.phone);
             setState(cur);
-            phoneChat = null;
-            const n = cur.phone.chats.filter(x => x.unread).length;
-            popup('phone', n ? `Новых переписок: ${n}` : 'Содержимое обновлено', hadPhone ? 'Телефон обновлён' : 'Телефон открыт');
+            popup('phone', 'Содержимое обновлено', hadPhone ? 'Телефон обновлён' : 'Телефон открыт');
             render();
         } catch (e) {
             console.error(`[${EXT}]`, e);
@@ -1327,28 +1319,21 @@ JSON SHAPE:
     }
 
     let phoneApp = null;
-    let phoneChat = null;
 
     function viewPhone(st) {
         if (!st) return emptyView();
         if (!S().mPhone) return '<div class="otm-none">Телефон выключен в настройках.</div>';
         const ph = st.phone;
-        if (!ph) return `<div class="otm-empty"><div class="otm-big">📱</div><div class="otm-etitle">Телефон ${esc(focusName())}</div><div class="otm-edesc">Контакты, переписки, история браузера, банк, заметки и галерея. Создаётся по запросу на основе вашей истории.</div><button class="otm-btn otm-primary" data-act="phonegen">📱 Взять телефон</button></div>`;
+        if (!ph) return `<div class="otm-empty"><div class="otm-big">📱</div><div class="otm-etitle">Телефон ${esc(focusName())}</div><div class="otm-edesc">Контакты, история браузера, банк и заметки. Создаётся по запросу на основе вашей истории.</div><button class="otm-btn otm-primary" data-act="phonegen">📱 Взять телефон</button></div>`;
         const bar = (title, back = true) => `<div class="otm-phonebar">${back ? '<button class="otm-mini-btn" data-act="phoneback">‹</button>' : ''}<b>${title}</b></div>`;
         const none = '<div class="otm-none">Пусто</div>';
 
         if (!phoneApp) {
-            const unread = ph.chats.filter(x => x.unread).length;
-            const apps = PH_APPS.map(([id, ic, t]) => `<button class="otm-app" data-act="phoneapp" data-app="${id}"><span>${ic}</span>${t}${id === 'messages' && unread ? `<em>${unread}</em>` : ''}</button>`).join('');
+            const apps = PH_APPS.map(([id, ic, t]) => `<button class="otm-app" data-act="phoneapp" data-app="${id}"><span>${ic}</span>${t}</button>`).join('');
             return `${bar(esc(ph.device), false)}<div class="otm-phone-grid">${apps}</div><div class="otm-foot"><span>Обновлено: ${ago(ph.updatedAt)}</span><button class="otm-btn" data-act="phonegen">🔄 Обновить</button></div>`;
         }
         if (phoneApp === 'contacts') {
             return bar('👥 Контакты') + (ph.contacts.map(x => `<div class="otm-pitem"><b>${esc(x.name)}</b><small>${esc(x.relation)}${x.note ? ' · ' + esc(x.note) : ''}</small></div>`).join('') || none);
-        }
-        if (phoneApp === 'messages') {
-            const ch = phoneChat ? ph.chats.find(x => x.id === phoneChat) : null;
-            if (ch) return bar(esc(ch.with)) + `<div class="otm-bubbles">${ch.messages.map(m => `<div class="otm-bub ${m.from}">${esc(m.text)}${m.time ? `<small>${esc(m.time)}</small>` : ''}</div>`).join('')}</div>`;
-            return bar('💬 Сообщения') + (ph.chats.map(x => `<button class="otm-pitem otm-pbtn" data-act="phonechat" data-id="${esc(x.id)}"><b>${x.unread ? '● ' : ''}${esc(x.with)}</b><small>${esc(cut(x.messages[x.messages.length - 1].text, 60))}</small></button>`).join('') || none);
         }
         if (phoneApp === 'browser') {
             return bar('🌐 Браузер') + `<div class="otm-pitem">🔍 История поиска</div>` + (ph.searches.map(x => `<div class="otm-pitem">${esc(x.query)}${x.when ? `<small>${esc(x.when)}</small>` : ''}</div>`).join('') || none);
@@ -1360,9 +1345,6 @@ JSON SHAPE:
         }
         if (phoneApp === 'notes') {
             return bar('📝 Заметки') + (ph.notes.map(x => `<div class="otm-pitem"><b>${esc(x.title)}</b><small>${esc(x.text)}</small></div>`).join('') || none);
-        }
-        if (phoneApp === 'gallery') {
-            return bar('🖼️ Галерея') + (ph.gallery.map(x => `<div class="otm-pitem">🖼️ ${esc(x.caption)}${x.when ? `<small>${esc(x.when)}</small>` : ''}</div>`).join('') || none);
         }
         phoneApp = null;
         return viewPhone(st);
@@ -1569,16 +1551,9 @@ JSON SHAPE:
                 }
             } else if (act === 'phoneapp') {
                 phoneApp = el.dataset.app;
-                phoneChat = null;
                 render();
             } else if (act === 'phoneback') {
-                if (phoneChat) phoneChat = null; else phoneApp = null;
-                render();
-            } else if (act === 'phonechat') {
-                phoneChat = el.dataset.id;
-                const st1 = getState();
-                const ch = st1?.phone?.chats?.find(x => x.id === phoneChat);
-                if (ch?.unread) { ch.unread = false; setState(st1); }
+                phoneApp = null;
                 render();
             } else if (act === 'phonegen') {
                 await runPhone();
