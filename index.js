@@ -1,5 +1,5 @@
 // Otome System — окно «Системы» в стиле отомэ-манхв для SillyTavern
-// Настроение, чувства, мысли, задания, штрафы, правила, подсказки, дневник.
+// Настроение, чувства, мысли, задания, штрафы, правила, подсказки, дневник, телефон.
 // Данные хранятся в самом чате (у каждой истории своя Система).
 
 (() => {
@@ -23,6 +23,7 @@
         mEnd: true,        // архив концовок
         mCal: true,        // календарь и события
         mFP: true,         // очки судьбы (FP) и магазин
+        mPhone: true,      // телефон героя
         extra: '',         // свои пожелания к Системе
         pos: null,
     };
@@ -129,7 +130,7 @@
 
     const POP = {
         fp: ['💎', 'Очки судьбы'], quest: ['📜', 'Задание'], reward: ['🎁', 'Награда'], penalty: ['⚠️', 'Штраф'], ach: ['🏆', 'Достижение'],
-        event: ['✦', 'Событие'], stage: ['💞', 'Этап отношений'], news: ['📰', 'Газета'], stat: ['💗', 'Чувства'],
+        event: ['✦', 'Событие'], stage: ['💞', 'Этап отношений'], news: ['📰', 'Газета'], stat: ['💗', 'Чувства'], phone: ['📱', 'Телефон'],
     };
     const LEVEL_TITLE = { minor: 'Малый штраф', major: 'Серьёзный штраф', critical: 'Критическое последствие' };
 
@@ -492,6 +493,7 @@ ${buildSchema()}`;
             endings: old?.endings || [],
             calendar: old?.calendar || null,
             papers: old?.papers || [],
+            phone: old?.phone || null,
             hook: null,
             lastTurn: t,
             updatedAt: Date.now(),
@@ -758,6 +760,93 @@ JSON SHAPE:
         } catch (e) {
             console.error(`[${EXT}]`, e);
             toast('Ошибка выпуска газеты, подробности в консоли.', 'error', true);
+        } finally {
+            busy = false;
+            setBusyUI(false);
+        }
+    }
+
+    // ─── телефон героя ─────────────────────────────────────────────────────
+
+    const PH_APPS = [['contacts', '👥', 'Контакты'], ['messages', '💬', 'Сообщения'], ['browser', '🌐', 'Браузер'], ['bank', '🏦', 'Банк'], ['notes', '📝', 'Заметки'], ['gallery', '🖼️', 'Галерея']];
+
+    function buildPhonePrompts(st, full) {
+        const c = ctx();
+        const cn = focusName();
+        const un = c.name1 || 'User';
+        const system = `You generate the content of ${cn}'s personal phone for an otome-game-style roleplay. Reply with ONE valid JSON object only: no markdown, no text outside the JSON. All text values in Russian. Never write explicit content.`;
+        let p = `CHARACTER PROFILE (${cn}): ${st.profile || ''}\nPLAYER PERSONA: ${un}\nRELATIONSHIP STAGE: ${st.stage}\n`;
+        p += `STATS: ${st.stats.map(x => `${x.name} ${x.value}`).join(', ')}\n`;
+        p += `SECRETLY FEELS: ${st.hides}\nTHOUGHT: ${st.thought}\n`;
+        p += `ACTIVE PLOT THREADS: ${st.quests.filter(q => q.status === 'active').map(q => q.title).join('; ') || 'none'}\n`;
+        if (st.memories?.length) p += `MEMORIES: ${st.memories.slice(0, 8).map(m => m.text).join('; ')}\n`;
+        const nd = nowDay(st);
+        if (nd != null) p += `IN-STORY DATE: ${fmtFull(nd)}\n`;
+        if (S().extra.trim()) p += `PLAYER'S WISHES: ${S().extra.trim()}\n`;
+        if (st.phone) p += `\nCURRENT PHONE CONTENT (keep ids, contacts and balance continuity): ${cut(JSON.stringify(st.phone), 5000)}\n`;
+        p += full ? '\nThe recent chat is the conversation above.\n' : `\nRECENT CHAT:\n${recent(8, 900)}\n`;
+        p += `
+TASK: ${st.phone ? 'Update' : 'Create'} the content of ${cn}'s phone.
+RULES:
+- The phone is what ${cn} would really own in this setting. If there are no phones in this world (fantasy, historical), make an in-world equivalent (enchanted mirror, magic tablet, etc.) and adapt the currency and the bank (banking house, guild treasury...).
+- contacts: 5-8 people from ${cn}'s life (family, work, friends, rivals, staff). Include ${un}, saved under the name or nickname ${cn} would REALLY use: it reveals feelings and may change with the relationship stage.
+- chats: 3-5 conversations with 3-8 messages each, in the voices of the people, consistent with the profile and the chat. "me" = ${cn}. Messages may hint at what ${cn} hides, but must not resolve the plot or contradict the chat. When updating, add messages that follow the latest events and keep max 8 per chat. unread=true for chats with fresh messages.
+- bank: balance and 5-8 transactions that fit ${cn}'s job and status. amount is signed (expense < 0). One or two items may quietly hint at the plot or at ${un} (a gift, an odd expense), only if it fits.
+- searches: 4-6 recent browser queries that reveal ${cn}'s worries and plans.
+- notes: 2-3 short notes (lists, drafts, unsent messages). gallery: 3-5 photo captions describing what the photo shows.
+- The phone only knows what ${cn} knows and did.
+
+JSON SHAPE:
+{"device": "<what the device is called in this world>", "contacts": [{"id": "p1", "name": "<as saved>", "relation": "<short>", "note": ""}], "chats": [{"id": "m1", "with": "<contact name>", "unread": false, "messages": [{"from": "me|them", "text": "", "time": "HH:MM"}]}], "bank": {"name": "", "currency": "", "balance": 0, "tx": [{"title": "", "amount": 0, "when": "<short>"}]}, "searches": [{"query": "", "when": "<short>"}], "notes": [{"title": "", "text": ""}], "gallery": [{"caption": "", "when": ""}]}`;
+        return { system, prompt: p };
+    }
+
+    function normPhone(raw, old) {
+        const arr = v => (Array.isArray(v) ? v : []);
+        const b = raw.bank || {};
+        return {
+            device: str(raw.device) || old?.device || 'Телефон',
+            contacts: arr(raw.contacts).slice(0, 10).map((x, i) => ({ id: str(x?.id) || 'p' + (i + 1), name: str(x?.name), relation: str(x?.relation), note: str(x?.note) })).filter(x => x.name),
+            chats: arr(raw.chats).slice(0, 6).map((x, i) => ({
+                id: str(x?.id) || 'm' + (i + 1), with: str(x?.with), unread: x?.unread === true,
+                messages: arr(x?.messages).slice(-10).map(m => ({ from: m?.from === 'me' ? 'me' : 'them', text: str(m?.text), time: str(m?.time) })).filter(m => m.text),
+            })).filter(x => x.with && x.messages.length),
+            bank: {
+                name: str(b.name) || old?.bank?.name || 'Банк', currency: str(b.currency) || old?.bank?.currency || '₽',
+                balance: Math.round(num(b.balance)),
+                tx: arr(b.tx).slice(0, 10).map(t => ({ title: str(t?.title), amount: Math.round(num(t?.amount)), when: str(t?.when) })).filter(t => t.title),
+            },
+            searches: arr(raw.searches).slice(0, 8).map(x => ({ query: str(x?.query), when: str(x?.when) })).filter(x => x.query),
+            notes: arr(raw.notes).slice(0, 5).map(x => ({ title: str(x?.title), text: str(x?.text) })).filter(x => x.title || x.text),
+            gallery: arr(raw.gallery).slice(0, 6).map(x => ({ caption: str(x?.caption), when: str(x?.when) })).filter(x => x.caption),
+            turn: turns(), updatedAt: Date.now(),
+        };
+    }
+
+    async function runPhone() {
+        if (busy) return;
+        const st = getState();
+        if (!st) return;
+        busy = true;
+        setBusyUI(true);
+        try {
+            const { system, prompt } = buildPhonePrompts(st, S().fullPreset);
+            const raw = await callLLM(system, prompt, S().fullPreset);
+            if (!raw || !Array.isArray(raw.contacts) || !raw.contacts.length) {
+                toast('Телефон не загрузился: модель не вернула данные. Попробуйте ещё раз.', 'error', true);
+                return;
+            }
+            const cur = getState() || st;
+            const hadPhone = !!cur.phone;
+            cur.phone = normPhone(raw, cur.phone);
+            setState(cur);
+            phoneChat = null;
+            const n = cur.phone.chats.filter(x => x.unread).length;
+            popup('phone', n ? `Новых переписок: ${n}` : 'Содержимое обновлено', hadPhone ? 'Телефон обновлён' : 'Телефон открыт');
+            render();
+        } catch (e) {
+            console.error(`[${EXT}]`, e);
+            toast('Ошибка телефона, подробности в консоли.', 'error', true);
         } finally {
             busy = false;
             setBusyUI(false);
@@ -1237,6 +1326,48 @@ JSON SHAPE:
             ${notes ? section('Купленные записи') + notes : ''}${led ? section('Журнал очков') + led : ''}`;
     }
 
+    let phoneApp = null;
+    let phoneChat = null;
+
+    function viewPhone(st) {
+        if (!st) return emptyView();
+        if (!S().mPhone) return '<div class="otm-none">Телефон выключен в настройках.</div>';
+        const ph = st.phone;
+        if (!ph) return `<div class="otm-empty"><div class="otm-big">📱</div><div class="otm-etitle">Телефон ${esc(focusName())}</div><div class="otm-edesc">Контакты, переписки, история браузера, банк, заметки и галерея. Создаётся по запросу на основе вашей истории.</div><button class="otm-btn otm-primary" data-act="phonegen">📱 Взять телефон</button></div>`;
+        const bar = (title, back = true) => `<div class="otm-phonebar">${back ? '<button class="otm-mini-btn" data-act="phoneback">‹</button>' : ''}<b>${title}</b></div>`;
+        const none = '<div class="otm-none">Пусто</div>';
+
+        if (!phoneApp) {
+            const unread = ph.chats.filter(x => x.unread).length;
+            const apps = PH_APPS.map(([id, ic, t]) => `<button class="otm-app" data-act="phoneapp" data-app="${id}"><span>${ic}</span>${t}${id === 'messages' && unread ? `<em>${unread}</em>` : ''}</button>`).join('');
+            return `${bar(esc(ph.device), false)}<div class="otm-phone-grid">${apps}</div><div class="otm-foot"><span>Обновлено: ${ago(ph.updatedAt)}</span><button class="otm-btn" data-act="phonegen">🔄 Обновить</button></div>`;
+        }
+        if (phoneApp === 'contacts') {
+            return bar('👥 Контакты') + (ph.contacts.map(x => `<div class="otm-pitem"><b>${esc(x.name)}</b><small>${esc(x.relation)}${x.note ? ' · ' + esc(x.note) : ''}</small></div>`).join('') || none);
+        }
+        if (phoneApp === 'messages') {
+            const ch = phoneChat ? ph.chats.find(x => x.id === phoneChat) : null;
+            if (ch) return bar(esc(ch.with)) + `<div class="otm-bubbles">${ch.messages.map(m => `<div class="otm-bub ${m.from}">${esc(m.text)}${m.time ? `<small>${esc(m.time)}</small>` : ''}</div>`).join('')}</div>`;
+            return bar('💬 Сообщения') + (ph.chats.map(x => `<button class="otm-pitem otm-pbtn" data-act="phonechat" data-id="${esc(x.id)}"><b>${x.unread ? '● ' : ''}${esc(x.with)}</b><small>${esc(cut(x.messages[x.messages.length - 1].text, 60))}</small></button>`).join('') || none);
+        }
+        if (phoneApp === 'browser') {
+            return bar('🌐 Браузер') + `<div class="otm-pitem">🔍 История поиска</div>` + (ph.searches.map(x => `<div class="otm-pitem">${esc(x.query)}${x.when ? `<small>${esc(x.when)}</small>` : ''}</div>`).join('') || none);
+        }
+        if (phoneApp === 'bank') {
+            const b = ph.bank;
+            return bar(`🏦 ${esc(b.name)}`) + `<div class="otm-wallet"><div><b>${num(b.balance).toLocaleString('ru-RU')} ${esc(b.currency)}</b><small>баланс</small></div></div>`
+                + section('Операции') + (b.tx.map(t => `<div class="otm-pitem otm-tx"><span>${esc(t.title)}${t.when ? `<small>${esc(t.when)}</small>` : ''}</span><b class="otm-amt ${t.amount < 0 ? 'minus' : 'plus'}">${t.amount > 0 ? '+' : ''}${num(t.amount).toLocaleString('ru-RU')}</b></div>`).join('') || none);
+        }
+        if (phoneApp === 'notes') {
+            return bar('📝 Заметки') + (ph.notes.map(x => `<div class="otm-pitem"><b>${esc(x.title)}</b><small>${esc(x.text)}</small></div>`).join('') || none);
+        }
+        if (phoneApp === 'gallery') {
+            return bar('🖼️ Галерея') + (ph.gallery.map(x => `<div class="otm-pitem">🖼️ ${esc(x.caption)}${x.when ? `<small>${esc(x.when)}</small>` : ''}</div>`).join('') || none);
+        }
+        phoneApp = null;
+        return viewPhone(st);
+    }
+
     function viewSettings() {
         const s = S();
         const cur = getState();
@@ -1254,6 +1385,7 @@ JSON SHAPE:
             ${chk('mEnd', 'Архив концовок')}
             ${chk('mCal', 'Календарь и события')}
             ${chk('mFP', 'Очки судьбы и магазин', 'Очки за выполненные задания, достижения и концовки; траты в магазине')}
+            ${chk('mPhone', 'Телефон героя', 'Создаётся по кнопке отдельным запросом')}
             ${chk('inject', 'Подмешивать состояние в промпт', 'Персонаж ведёт себя по настроению и чувствам (около 80 токенов)')}
             ${chk('notify', 'Всплывающие уведомления')}
             ${chk('floating', 'Плавающая кнопка на экране')}
@@ -1276,7 +1408,7 @@ JSON SHAPE:
         const body = document.getElementById('otm-body');
         if (!body) return;
         const st = getState();
-        const views = { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, shop: viewShop };
+        const views = { status: viewStatus, quests: viewQuests, calendar: viewCalendar, phone: viewPhone, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, shop: viewShop };
         body.innerHTML = tab === 'settings' ? viewSettings() : views[tab](st);
         document.querySelectorAll('#otm-modal .otm-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
         const hb = document.getElementById('otm-heroes');
@@ -1297,6 +1429,8 @@ JSON SHAPE:
         }
         const shopTab = document.querySelector('#otm-modal [data-tab="shop"]');
         if (shopTab) shopTab.style.display = S().mFP ? '' : 'none';
+        const phoneTab = document.querySelector('#otm-modal [data-tab="phone"]');
+        if (phoneTab) phoneTab.style.display = S().mPhone ? '' : 'none';
         const sub = document.getElementById('otm-sub');
         if (sub) sub.textContent = st ? focusName() : '';
     }
@@ -1328,6 +1462,7 @@ JSON SHAPE:
                     <button class="otm-tab" data-tab="status">Статус</button>
                     <button class="otm-tab" data-tab="quests">Задания</button>
                     <button class="otm-tab" data-tab="calendar">Календарь</button>
+                    <button class="otm-tab" data-tab="phone">Телефон</button>
                     <button class="otm-tab" data-tab="news">Газета</button>
                     <button class="otm-tab" data-tab="collection">Достижения</button>
                     <button class="otm-tab" data-tab="endings">Концовки</button>
@@ -1432,6 +1567,21 @@ JSON SHAPE:
                     closePanel();
                     ta.focus();
                 }
+            } else if (act === 'phoneapp') {
+                phoneApp = el.dataset.app;
+                phoneChat = null;
+                render();
+            } else if (act === 'phoneback') {
+                if (phoneChat) phoneChat = null; else phoneApp = null;
+                render();
+            } else if (act === 'phonechat') {
+                phoneChat = el.dataset.id;
+                const st1 = getState();
+                const ch = st1?.phone?.chats?.find(x => x.id === phoneChat);
+                if (ch?.unread) { ch.unread = false; setState(st1); }
+                render();
+            } else if (act === 'phonegen') {
+                await runPhone();
             } else if (act === 'rollback') {
                 const cur = getState();
                 if (cur?.prev) {
@@ -1451,7 +1601,7 @@ JSON SHAPE:
             } else if (act === 'import') {
                 document.getElementById('otm-file')?.click();
             } else if (act === 'recreate') {
-                if (confirm('Пересоздать Систему с нуля? Журнал, дневник, газета и очки судьбы этого чата будут стёрты.')) {
+                if (confirm('Пересоздать Систему с нуля? Журнал, дневник, газета, телефон и очки судьбы этого чата будут стёрты.')) {
                     await runUpdate({ fresh: true });
                 }
             } else if (act === 'wipe') {
@@ -1493,6 +1643,7 @@ JSON SHAPE:
             applyTheme();
             applyFloating();
             applyInjection();
+            render();
         });
     }
 
@@ -1560,7 +1711,7 @@ JSON SHAPE:
     // ─── init ──────────────────────────────────────────────────────────────
 
     if (globalThis.__OTOME_TEST__) {
-        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, buildPrompts, compact, cut, clean, seasonOf, lastIB, buildPaperPrompts, announce, isGroup, groupInfo, focusKey, focusChar, setFocus, getState, setState, buyLocal, SHOP, parseDMY, nowDay, overdueNote, rel, fmtFull, monthGrid, views: { status: viewStatus, quests: viewQuests, calendar: viewCalendar, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, shop: viewShop, settings: viewSettings } });
+        Object.assign(globalThis.__OTOME_TEST__, { extractJson, normalize, normPhone, buildPrompts, compact, cut, clean, seasonOf, lastIB, buildPaperPrompts, buildPhonePrompts, announce, isGroup, groupInfo, focusKey, focusChar, setFocus, getState, setState, buyLocal, SHOP, parseDMY, nowDay, overdueNote, rel, fmtFull, monthGrid, views: { status: viewStatus, quests: viewQuests, calendar: viewCalendar, phone: viewPhone, news: viewNews, collection: viewCollection, endings: viewEndings, log: viewLog, shop: viewShop, settings: viewSettings } });
     }
 
     jQuery(async () => {
